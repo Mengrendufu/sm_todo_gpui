@@ -2424,11 +2424,7 @@ impl UI_Controls {
                     .on_click(cx.listener(|_, _, _, _| UI_Inbox_post(UI_Evt::RetryPersistence))))
                 .into_any_element()
         } else {
-            div().text_xs().text_color(theme.ink_soft()).child(
-                if self.closing { "正在保存并退出…" }
-                else if self.persistence.is_saved() { "" }
-                else { "正在保存…" }
-            ).into_any_element()
+            div().into_any_element()
         }
     }
 
