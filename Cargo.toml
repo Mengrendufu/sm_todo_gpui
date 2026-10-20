@@ -1,0 +1,23 @@
+[package]
+name = "sm_todo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rs_sst = { git = "https://github.com/Mengrendufu/rs_sst.git", rev = "005b8e03efd6e25e834f57f8d42333fc886672ee" }
+gpui = "0.2.2"
+async-channel = "2"
+kanban-core = { path = "../gui/sm_todo/src-tauri/kanban-core" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_Com"] }
+
+[lib]
+name = "sm_todo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sm_todo"
+path = "src/main.rs"
