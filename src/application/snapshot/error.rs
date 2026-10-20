@@ -21,9 +21,3 @@ impl Serialize for AppError {
         serializer.serialize_str(&self.to_string())
     }
 }
-
-impl From<rusqlite::Error> for AppError {
-    fn from(value: rusqlite::Error) -> Self {
-        Self::Db(value.to_string())
-    }
-}

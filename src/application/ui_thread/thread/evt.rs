@@ -15,9 +15,7 @@ pub enum UI_Evt {
     CancelEditor,
     SaveEditor,
     DeleteEditor,
-    PersistMove {
-        id: String,
-        to_status: crate::application::data::Status,
-        before_id: Option<String>,
-    },
+    PersistPending,
+    RetryPersistence,
+    Persisted(crate::application::data_manager::PersistResult),
 }

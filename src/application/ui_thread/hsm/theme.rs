@@ -1,7 +1,7 @@
 //! Charmtone Crush Pantera tokens, matching Tauri `App.css` light `:root` and dark `@media`.
 
 use gpui::{rgb, rgba, Rgba};
-use crate::application::data::Priority;
+use crate::application::snapshot::Priority;
 
 /// `#fffaf1` `--bg`
 pub const BG: u32 = 0xfffaf1;
@@ -249,7 +249,7 @@ impl Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::data::Priority;
+    use crate::application::snapshot::Priority;
 
     fn round_alpha(channel: f32) -> u32 {
         (channel * 255.0).round() as u32

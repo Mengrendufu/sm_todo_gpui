@@ -1,7 +1,7 @@
 //! Passive board projections. No events, no authority.
 
 use gpui::{div, prelude::*, px, rgb, Rgba, WindowControlArea};
-use crate::application::data::{Card, Priority};
+use crate::application::snapshot::{Card, Priority};
 
 use super::{card_meta, theme::Theme};
 

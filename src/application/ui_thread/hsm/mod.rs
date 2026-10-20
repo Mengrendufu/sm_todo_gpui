@@ -14,7 +14,9 @@ mod window_taskbar;
 mod top_edge_dock;
 mod tray_icon;
 
-use crate::application::data::DataManager;
+use crate::application::data_manager::DataClient;
+use crate::application::snapshot::Snapshot;
+use crate::application::data_manager::Persistence;
 use crate::application::ui_thread::thread::evt::UI_Evt;
 use crate::application::ui_thread::thread::inbox::UI_Inbox_post;
 use rs_hsm_::{SM_Hsm, SM_HsmTrait};
@@ -29,7 +31,7 @@ use gpui::{
 };
 #[cfg(test)]
 use gpui::{Pixels, Point};
-use crate::application::data::{Card, Priority, Status};
+use crate::application::snapshot::{Card, Priority, Status};
 
 const HOLE_ANIM_MS: u64 = 280;
 const SETTLE_ANIM_MS: u64 = 140;
@@ -494,10 +496,10 @@ impl DerefMut for SM_UI {
 }
 
 impl SM_UI {
-    pub fn setup(_host: SM_UI_HostOps, data: DataManager) -> Self {
+    pub fn setup(_host: SM_UI_HostOps, snapshot: Snapshot, client: DataClient) -> Self {
         let mut me = Self {
             hsm: SM_Hsm::new(),
-            controls: UI_Controls::new(data),
+            controls: UI_Controls::new(snapshot, client),
         };
         UI_Controls::init(&mut me.hsm, &mut me.controls);
         me
@@ -541,8 +543,10 @@ impl SM_UI {
 
 /// Controls owned by SM_UI's HSM context; all GPUI access stays on the GUI thread.
 pub struct UI_Controls {
-    data: DataManager,
-    cards: Vec<Card>,
+    snapshot: Snapshot,
+    persistence: Persistence,
+    persist_wake_pending: bool,
+    closing: bool,
     pinned: bool,
     dragging: Option<DragSession>,
     holes: Vec<HoleSlot>,
@@ -561,7 +565,6 @@ pub struct UI_Controls {
     list_scroll_y: f32,
     column_frame: [Option<(f32, f32, f32)>; 3],
     settling: Option<DropSettle>,
-    pending_persist: Option<(String, Status, Option<String>)>,
     scrollbar_drag: Option<ScrollbarDrag>,
     editor: Option<Editor>,
     title_field: Option<Entity<text_field::TextField>>,
@@ -574,10 +577,12 @@ pub struct UI_Controls {
 }
 
 impl UI_Controls {
-    fn new(data: DataManager) -> Self {
-        let mut me = Self {
-            data,
-            cards: Vec::new(),
+    fn new(snapshot: Snapshot, client: DataClient) -> Self {
+        Self {
+            snapshot,
+            persistence: Persistence::new(client),
+            persist_wake_pending: false,
+            closing: false,
             pinned: true,
             dragging: None,
             holes: Vec::new(),
@@ -600,7 +605,6 @@ impl UI_Controls {
             list_scroll_y: 0.0,
             column_frame: [None, None, None],
             settling: None,
-            pending_persist: None,
             scrollbar_drag: None,
             editor: None,
             title_field: None,
@@ -610,9 +614,7 @@ impl UI_Controls {
             calendar_year: 2026,
             calendar_month: 1,
             top_dock: top_edge_dock::TopEdgeDock::new(),
-        };
-        me.reload();
-        me
+        }
     }
 
     pub fn is_pinned(&self) -> bool {
@@ -633,8 +635,8 @@ impl UI_Controls {
     }
 
     pub fn add_todo_card(&mut self, title: &str) {
-        if self.data.createCard(title).is_ok() {
-            self.reload();
+        if let Ok(changes) = self.snapshot.create_card(title, "") {
+            self.persistence.stage(changes);
         }
     }
 
@@ -670,7 +672,7 @@ impl UI_Controls {
     }
 
     fn open_edit(&mut self, id: &str) {
-        let Some(card) = self.cards.iter().find(|card| card.id == id).cloned() else {
+        let Some(card) = self.snapshot.cards.iter().find(|card| card.id == id).cloned() else {
             return;
         };
         let (hour, minute) = card_meta::time_from_deadline(card.deadline_at);
@@ -745,13 +747,13 @@ impl UI_Controls {
         };
         let command = card_editor::command_on_editor_save(&editor.kind, fields);
         let result = match command {
-            card_editor::PersistCommand::Create(fields) => self.data.createCardWith(
+            card_editor::PersistCommand::Create(fields) => self.snapshot.create_card_with(
                 &fields.title,
                 &fields.notes,
                 fields.deadline_at,
                 fields.priority,
             ),
-            card_editor::PersistCommand::Update { id, fields } => self.data.updateCard(
+            card_editor::PersistCommand::Update { id, fields } => self.snapshot.update_card(
                 &id,
                 &fields.title,
                 &fields.notes,
@@ -761,9 +763,9 @@ impl UI_Controls {
             _ => return false,
         };
         match result {
-            Ok(_) => {
+            Ok(changes) => {
+                self.persistence.stage(changes);
                 self.editor = None;
-                self.reload();
                 true
             }
             Err(err) => {
@@ -781,11 +783,9 @@ impl UI_Controls {
         };
         match card_editor::command_on_editor_delete(&editor.kind) {
             card_editor::PersistCommand::Delete { id } => {
-                if self.data.deleteCard(&id).is_err() {
-                    return false;
-                }
+                let Ok(changes) = self.snapshot.delete_card(&id) else { return false; };
+                self.persistence.stage(changes);
                 self.editor = None;
-                self.reload();
                 true
             }
             _ => false,
@@ -849,7 +849,7 @@ impl UI_Controls {
     }
 
     pub fn cards_in(&self, status: Status) -> Vec<&Card> {
-        self.cards
+        self.snapshot.cards
             .iter()
             .filter(|card| card.status == status)
             .collect()
@@ -857,7 +857,7 @@ impl UI_Controls {
 
     pub fn column_items(&self, status: Status) -> Vec<ColumnItem<'_>> {
         let dragged = self.dragging.as_ref().map(|d| d.id.as_str());
-        let mut items: Vec<ColumnItem<'_>> = self
+        let mut items: Vec<ColumnItem<'_>> = self.snapshot
             .cards
             .iter()
             .filter(|card| card.status == status)
@@ -908,16 +908,17 @@ impl UI_Controls {
     }
 
     pub fn start_drag(&mut self, id: &str) {
-        let Some(index) = self.cards.iter().position(|card| card.id == id) else {
+        if self.closing { return; }
+        let Some(index) = self.snapshot.cards.iter().position(|card| card.id == id) else {
             return;
         };
-        let status = self.cards[index].status;
-        let card = &self.cards[index];
+        let status = self.snapshot.cards[index].status;
+        let card = &self.snapshot.cards[index];
         let inner = self.card_inner_width(status);
         let body = widgets::card_body_height(&card.title, &card.notes, inner);
         let pitch = body + widgets::SLOT_GAP;
         let width = self.ghost_size_for(status).0;
-        let before_id = self
+        let before_id = self.snapshot
             .cards
             .iter()
             .filter(|card| card.status == status)
@@ -994,7 +995,7 @@ impl UI_Controls {
 
     fn dest_pitches(&self, status: Status) -> Vec<f32> {
         let inner = self.card_inner_width(status);
-        self.cards
+        self.snapshot.cards
             .iter()
             .filter(|card| card.status == status)
             .filter(|card| self.dragging.as_ref().map(|d| d.id.as_str()) != Some(card.id.as_str()))
@@ -1117,7 +1118,7 @@ impl UI_Controls {
         if from_x == to_x && from_y == to_y {
             return None;
         }
-        let card = self
+        let card = self.snapshot
             .cards
             .iter()
             .find(|card| card.id == id)
@@ -1219,7 +1220,7 @@ impl UI_Controls {
 
     fn dest_ids(&self, status: Status) -> Vec<String> {
         let dragged = self.dragging.as_ref().map(|d| d.id.as_str());
-        self.cards
+        self.snapshot.cards
             .iter()
             .filter(|card| card.status == status)
             .filter(|card| dragged != Some(card.id.as_str()))
@@ -1228,9 +1229,10 @@ impl UI_Controls {
     }
 
     pub fn drop_card(&mut self, id: &str, to_status: Status, before_id: Option<&str>) {
+        if self.closing { return; }
         let settle = self.capture_settle(id, to_status, before_id);
-        self.move_card_local(id, to_status, before_id);
-        self.pending_persist = Some((id.to_string(), to_status, before_id.map(str::to_string)));
+        let Ok(changes) = self.snapshot.move_card(id, to_status, before_id) else { return; };
+        self.persistence.stage(changes);
         self.dragging = None;
         self.last_hover_status = None;
         self.last_insert_index = None;
@@ -1239,36 +1241,31 @@ impl UI_Controls {
         self.settling = settle;
     }
 
-    fn move_card_local(&mut self, id: &str, to_status: Status, before_id: Option<&str>) {
-        let Some(index) = self.cards.iter().position(|card| card.id == id) else {
-            return;
-        };
-        let mut card = self.cards.remove(index);
-        card.status = to_status;
-        let insert_at = match before_id {
-            Some(before) => self
-                .cards
-                .iter()
-                .position(|card| card.id == before)
-                .unwrap_or(self.cards.len()),
-            None => self
-                .cards
-                .iter()
-                .rposition(|card| card.status == to_status)
-                .map(|i| i + 1)
-                .unwrap_or(self.cards.len()),
-        };
-        self.cards.insert(insert_at, card);
-    }
-
     pub fn persist_pending(&self) -> bool {
-        self.pending_persist.is_some()
+        self.persistence.has_outbox()
     }
 
-    pub(super) fn take_pending_move(&mut self) -> Option<UI_Evt> {
-        self.pending_persist.take().map(|(id, to_status, before_id)| {
-            UI_Evt::PersistMove { id, to_status, before_id }
-        })
+    pub(super) fn post_pending(&mut self) {
+        self.persist_wake_pending = false;
+        self.persistence.post_pending();
+    }
+
+    pub(super) fn begin_close(&mut self) {
+        self.cancel_drag();
+        self.post_pending();
+        self.closing = true;
+    }
+
+    pub(super) fn ready_to_close(&self) -> bool {
+        self.closing && self.persistence.is_saved()
+    }
+
+    pub(super) fn close_failed(&mut self) -> bool {
+        if self.closing && self.persistence.error().is_some() {
+            self.closing = false;
+            return true;
+        }
+        false
     }
 
     pub fn commit_drop(&mut self) {
@@ -1407,10 +1404,6 @@ impl UI_Controls {
             .collect()
     }
 
-    fn reload(&mut self) {
-        self.cards = self.data.getCards().unwrap_or_default();
-    }
-
     pub fn flush(&mut self) -> Option<UI_Evt> {
         self.snapshot_column_frames();
         let hole_limit = Duration::from_millis(HOLE_ANIM_MS);
@@ -1419,19 +1412,21 @@ impl UI_Controls {
         self.slides
             .retain(|slide| slide.started.elapsed() < hole_limit);
         let settle_limit = Duration::from_millis(SETTLE_ANIM_MS);
-        match self.settling.as_ref().map(|settle| settle.shown) {
-            Some(false) => None,
+        let can_post = match self.settling.as_ref().map(|settle| settle.shown) {
+            Some(false) => false,
             Some(true) => {
-                if self
-                    .settling
-                    .as_ref()
-                    .is_some_and(|settle| settle.started.elapsed() >= settle_limit)
-                {
+                if self.settling.as_ref().is_some_and(|settle| settle.started.elapsed() >= settle_limit) {
                     self.settling = None;
                 }
-                self.take_pending_move()
+                true
             }
-            None => self.take_pending_move(),
+            None => true,
+        };
+        if can_post && self.persistence.has_outbox() && !self.persist_wake_pending {
+            self.persist_wake_pending = true;
+            Some(UI_Evt::PersistPending)
+        } else {
+            None
         }
     }
 
@@ -1862,7 +1857,7 @@ impl UI_Controls {
             .iter()
             .filter(|slide| slide.status == status)
             .filter_map(|slide| {
-                let card = self.cards.iter().find(|card| card.id == slide.id)?;
+                let card = self.snapshot.cards.iter().find(|card| card.id == slide.id)?;
                 let from_y = slide.from_y;
                 let to_y = slide.to_y;
                 let body = widgets::card_body_height(&card.title, &card.notes, inner);
@@ -2421,6 +2416,22 @@ impl Render for SM_UI {
 }
 
 impl UI_Controls {
+    fn persistence_status(&self, theme: theme::Theme, cx: &mut Context<SM_UI>) -> gpui::AnyElement {
+        if let Some(error) = self.persistence.error() {
+            div().id("persistence-error").flex().gap_2().text_xs().text_color(theme.danger())
+                .child(format!("未保存：{error}"))
+                .child(div().id("retry-persistence").cursor_pointer().child("重试")
+                    .on_click(cx.listener(|_, _, _, _| UI_Inbox_post(UI_Evt::RetryPersistence))))
+                .into_any_element()
+        } else {
+            div().text_xs().text_color(theme.ink_soft()).child(
+                if self.closing { "正在保存并退出…" }
+                else if self.persistence.is_saved() { "" }
+                else { "正在保存…" }
+            ).into_any_element()
+        }
+    }
+
     fn render_controls(&mut self, window: &mut Window, cx: &mut Context<SM_UI>) -> impl IntoElement {
         // Preserve the first landing frame before scheduling persistence.
         if let Some(e) = self.flush() {
@@ -2519,7 +2530,8 @@ impl UI_Controls {
                                     .rounded(px(1.2))
                                     .bg(theme.on_primary()),
                             ),
-                    ),
+                    )
+                    .child(self.persistence_status(theme, cx)),
             )
             .child(
                 div()
@@ -2540,6 +2552,13 @@ impl UI_Controls {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::data_manager::DataManager;
+
+    fn test_ui() -> (DataManager, SM_UI) {
+        let (database, cards) = DataManager::open_in_memory(|_| {}).unwrap();
+        let ui = SM_UI::setup(host(), Snapshot::new(cards), database.client());
+        (database, ui)
+    }
 
     fn flush(sm: &mut SM_UI) {
         if let Some(e) = sm.controls.flush() {
@@ -2582,7 +2601,7 @@ mod tests {
         sm.squeeze_offsets()
             .into_iter()
             .map(|(id, dy)| {
-                let title = sm
+                let title = sm.snapshot
                     .cards
                     .iter()
                     .find(|card| card.id == id)
@@ -2597,7 +2616,7 @@ mod tests {
         sm.squeeze_paths()
             .into_iter()
             .map(|(id, from, to)| {
-                let title = sm
+                let title = sm.snapshot
                     .cards
                     .iter()
                     .find(|card| card.id == id)
@@ -2625,13 +2644,13 @@ mod tests {
 
     #[test]
     fn window_starts_pinned() {
-        let sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, sm) = test_ui();
         assert!(sm.is_pinned());
     }
 
     #[test]
     fn editor_or_drag_holds_the_top_dock_open() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         assert!(!sm.dock_hold_open());
         sm.open_create();
         assert!(sm.dock_hold_open());
@@ -2647,7 +2666,7 @@ mod tests {
 
     #[test]
     fn toggle_pin_flips_always_on_top_flag() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         assert!(!sm.toggle_pin());
         assert!(!sm.is_pinned());
         assert!(sm.toggle_pin());
@@ -2656,7 +2675,7 @@ mod tests {
 
     #[test]
     fn add_todo_card_lands_in_todo() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         assert!(sm.cards_in(Status::Todo).is_empty());
         sm.add_todo_card("Hello");
         assert_eq!(sm.cards_in(Status::Todo).len(), 1);
@@ -2667,7 +2686,7 @@ mod tests {
 
     #[test]
     fn drop_card_to_doing_appends() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         let a = ids(&sm, Status::Todo)[0].clone();
@@ -2678,7 +2697,7 @@ mod tests {
 
     #[test]
     fn drop_card_inserts_before_target() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
@@ -2689,7 +2708,7 @@ mod tests {
 
     #[test]
     fn start_drag_leaves_hole_in_place() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         let a = ids(&sm, Status::Todo)[0].clone();
@@ -2700,7 +2719,7 @@ mod tests {
 
     #[test]
     fn hover_doing_moves_hole_without_persist() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         let a = ids(&sm, Status::Todo)[0].clone();
@@ -2714,7 +2733,7 @@ mod tests {
 
     #[test]
     fn commit_drop_persists_hovered_slot() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         let a = ids(&sm, Status::Todo)[0].clone();
@@ -2728,7 +2747,7 @@ mod tests {
 
     #[test]
     fn drop_keeps_store_write_off_the_release_frame() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         let a = ids(&sm, Status::Todo)[0].clone();
@@ -2749,7 +2768,7 @@ mod tests {
 
     #[test]
     fn cancel_drag_restores_without_persist() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         let a = ids(&sm, Status::Todo)[0].clone();
@@ -2770,7 +2789,7 @@ mod tests {
 
     #[test]
     fn start_drag_holds_hole_at_full_height() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         let a = ids(&sm, Status::Todo)[0].clone();
@@ -2781,7 +2800,7 @@ mod tests {
 
     #[test]
     fn hover_insert_closes_old_hole_and_opens_new() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         let a = ids(&sm, Status::Todo)[0].clone();
@@ -2801,7 +2820,7 @@ mod tests {
 
     #[test]
     fn hover_insert_bumps_epoch_on_each_move() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         let a = ids(&sm, Status::Todo)[0].clone();
         sm.start_drag(&a);
@@ -2813,7 +2832,7 @@ mod tests {
 
     #[test]
     fn same_column_squeeze_slides_cards_instead_of_a_second_hole() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
@@ -2837,7 +2856,7 @@ mod tests {
 
     #[test]
     fn two_card_column_squeeze_does_not_leave_a_third_slot() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         let todo = ids(&sm, Status::Todo);
@@ -2859,7 +2878,7 @@ mod tests {
 
     #[test]
     fn squeeze_up_overlay_starts_at_the_old_slot() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
@@ -2875,11 +2894,11 @@ mod tests {
 
     #[test]
     fn squeeze_overlay_starts_from_old_hole_height() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("Tall");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
-        sm.cards[0].notes = "a\nb\nc\nd".to_string();
+        sm.snapshot.cards[0].notes = "a\nb\nc\nd".to_string();
         let tall = widgets::card_pitch("Tall", "a\nb\nc\nd", 0.0);
         assert!(tall > widgets::SLOT_PITCH);
         let todo = ids(&sm, Status::Todo);
@@ -2917,7 +2936,7 @@ mod tests {
 
     #[test]
     fn same_column_squeeze_jumps_to_pointer_slot() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
@@ -3095,7 +3114,7 @@ mod tests {
 
     #[test]
     fn top_half_squeezes_hole_after_the_card() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
@@ -3107,7 +3126,7 @@ mod tests {
 
     #[test]
     fn collision_uses_ghost_volume_not_pointer() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
@@ -3125,7 +3144,7 @@ mod tests {
 
     #[test]
     fn upward_ghost_top_contact_opens_hole_ahead() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
@@ -3139,7 +3158,7 @@ mod tests {
 
     #[test]
     fn upward_ghost_volume_reaches_column_top() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
@@ -3154,7 +3173,7 @@ mod tests {
 
     #[test]
     fn downward_thin_overlap_does_not_squeeze() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
@@ -3168,7 +3187,7 @@ mod tests {
 
     #[test]
     fn downward_onto_card_opens_hole_ahead() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
@@ -3250,7 +3269,7 @@ mod tests {
 
     #[test]
     fn reverse_squeeze_up_after_down_onto_the_card_above() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
@@ -3271,7 +3290,7 @@ mod tests {
 
     #[test]
     fn upward_onto_card_opens_hole_ahead() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
@@ -3283,7 +3302,7 @@ mod tests {
 
     #[test]
     fn upward_squeeze_reaches_column_top() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
@@ -3295,7 +3314,7 @@ mod tests {
 
     #[test]
     fn staying_on_same_card_does_not_flip_hole() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
@@ -3311,7 +3330,7 @@ mod tests {
 
     #[test]
     fn leaving_card_still_moves_hole() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
@@ -3351,7 +3370,7 @@ mod tests {
 
     #[test]
     fn commit_drop_settles_card_from_ghost_into_slot() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         let a = ids(&sm, Status::Todo)[0].clone();
@@ -3372,7 +3391,7 @@ mod tests {
 
     #[test]
     fn drop_starts_at_fractional_preview_origin_and_moves_on_the_next_frame() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         let a = ids(&sm, Status::Todo)[0].clone();
         sm.start_drag(&a);
@@ -3394,11 +3413,11 @@ mod tests {
 
     #[test]
     fn same_column_drop_uses_remaining_cards_heights_for_the_landing_target() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
-        sm.cards[0].notes = "one\ntwo\nthree".into();
-        let a = sm.cards[0].id.clone();
+        sm.snapshot.cards[0].notes = "one\ntwo\nthree".into();
+        let a = sm.snapshot.cards[0].id.clone();
         sm.start_drag(&a);
         sm.note_drag_geometry(200.0, 1000.0, 40.0, 50.0, 0.0);
         sm.hover_pointer(Status::Todo, 1000.0);
@@ -3410,7 +3429,7 @@ mod tests {
 
     #[test]
     fn subpixel_drop_distance_is_animated_instead_of_snapping() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         let a = ids(&sm, Status::Todo)[0].clone();
         sm.start_drag(&a);
@@ -3422,7 +3441,7 @@ mod tests {
 
     #[test]
     fn append_drop_uses_its_committed_target_instead_of_the_last_hover_index() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         let a = ids(&sm, Status::Todo)[0].clone();
@@ -3438,7 +3457,7 @@ mod tests {
 
     #[test]
     fn flush_does_not_drop_settle_before_first_paint() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         let a = ids(&sm, Status::Todo)[0].clone();
@@ -3458,7 +3477,7 @@ mod tests {
 
     #[test]
     fn drop_settles_from_pointer_and_dest_frame_without_list_hit() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         let a = ids(&sm, Status::Todo)[0].clone();
@@ -3475,7 +3494,7 @@ mod tests {
 
     #[test]
     fn open_create_does_not_persist_a_card() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.open_create();
         assert!(sm.editor_is_open());
         assert!(sm.cards_in(Status::Todo).is_empty());
@@ -3483,7 +3502,7 @@ mod tests {
 
     #[test]
     fn save_create_persists_editor_fields() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.open_create();
         sm.set_editor_title("买菜");
         sm.set_editor_notes("今晚");
@@ -3503,7 +3522,7 @@ mod tests {
 
     #[test]
     fn save_create_persists_half_hour_deadline() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.open_create();
         sm.set_editor_title("买菜");
         sm.set_editor_deadline("2026-08-24", 18, 30);
@@ -3517,7 +3536,7 @@ mod tests {
 
     #[test]
     fn save_create_rejects_blank_title() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.open_create();
         sm.set_editor_title("   ");
         assert!(!sm.save_editor());
@@ -3528,7 +3547,7 @@ mod tests {
 
     #[test]
     fn save_edit_updates_existing_card() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         let id = ids(&sm, Status::Todo)[0].clone();
         sm.open_edit(&id);
@@ -3546,7 +3565,7 @@ mod tests {
 
     #[test]
     fn cancel_edit_does_not_persist() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         let id = ids(&sm, Status::Todo)[0].clone();
         sm.open_edit(&id);
@@ -3558,7 +3577,7 @@ mod tests {
 
     #[test]
     fn delete_edit_removes_the_card() {
-        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        let (_database, mut sm) = test_ui();
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         let id = ids(&sm, Status::Todo)[0].clone();
