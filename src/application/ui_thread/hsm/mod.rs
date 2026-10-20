@@ -1,9 +1,5 @@
 //! GUI-thread HSM owner and its controls. Local feedback stays in GPUI callbacks.
 
-pub mod calendar;
-pub mod card_editor;
-pub mod card_meta;
-pub mod text_field;
 pub mod theme;
 pub mod widgets;
 pub mod window_pin;
@@ -13,6 +9,9 @@ mod window_chrome;
 mod window_taskbar;
 mod top_edge_dock;
 mod tray_icon;
+
+use widgets::{add_card_button, card, card_section, title};
+use widgets::card::{calendar, editor as card_editor, meta as card_meta, text_field};
 
 use crate::application::data_manager::DataClient;
 use crate::application::snapshot::Snapshot;
@@ -26,8 +25,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     div, ease_in_out, point, prelude::*, px, Animation, AnimationExt as _, Context,
-    DragMoveEvent, Entity, Focusable, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
-    Render, Window, WindowControlArea, actions,
+    Entity, Focusable, KeyBinding, MouseButton, MouseMoveEvent,
+    Render, Window, actions,
 };
 #[cfg(test)]
 use gpui::{Pixels, Point};
@@ -69,14 +68,14 @@ impl Render for DragPreview {
         let theme = theme::Theme::for_window(window);
         div()
             .w(px(self.width))
-            .h(px(widgets::card_body_height(
+            .h(px(card::card_body_height(
                 &self.card.title,
                 &self.card.notes,
-                (self.width - widgets::COLUMN_PAD_X * 2.0).max(0.0),
+                (self.width - card_section::COLUMN_PAD_X * 2.0).max(0.0),
             )))
             .overflow_hidden()
             .opacity(0.7)
-            .child(widgets::CardTile(&self.card, theme))
+            .child(card::render(&self.card, theme))
     }
 }
 
@@ -103,29 +102,29 @@ fn slot_origin_y(list_origin_y: f32, scroll_y: f32, index: usize, pitches: &[f32
 }
 
 fn slot_origin_x(list_origin_x: f32) -> f32 {
-    list_origin_x + widgets::COLUMN_PAD_X
+    list_origin_x + card_section::COLUMN_PAD_X
 }
 
 #[cfg(test)]
 fn slot_boundary(pitches: &[f32], index: usize) -> f32 {
     let pitch = pitches.get(index).copied().unwrap_or(0.0);
-    pitches.iter().take(index).sum::<f32>() + pitch - widgets::SLOT_GAP / 2.0
+    pitches.iter().take(index).sum::<f32>() + pitch - card::SLOT_GAP / 2.0
 }
 
 #[cfg(test)]
 fn insert_boundary(index: usize) -> f32 {
-    let pitches = vec![widgets::SLOT_PITCH; index + 1];
+    let pitches = vec![card::SLOT_PITCH; index + 1];
     slot_boundary(&pitches, index)
 }
 
 #[cfg(test)]
 fn squeeze_down_y(dest_top: f32) -> f32 {
-    dest_top - widgets::SLOT_BODY / 2.0 + widgets::INSERT_HYSTERESIS
+    dest_top - card::SLOT_BODY / 2.0 + card::INSERT_HYSTERESIS
 }
 
 #[cfg(test)]
 fn squeeze_up_y(dest_top: f32) -> f32 {
-    dest_top + widgets::SLOT_BODY / 2.0 - widgets::INSERT_HYSTERESIS
+    dest_top + card::SLOT_BODY / 2.0 - card::INSERT_HYSTERESIS
 }
 
 fn dest_visual_span(
@@ -138,7 +137,7 @@ fn dest_visual_span(
     let body = pitches
         .get(index)
         .copied()
-        .map(|pitch| (pitch - widgets::SLOT_GAP).max(0.0))
+        .map(|pitch| (pitch - card::SLOT_GAP).max(0.0))
         .unwrap_or(0.0);
     let top = if index >= hole_index {
         packed_top + hole_pitch
@@ -241,7 +240,7 @@ fn raw_insert_from_ghost(ghost_top: f32, ghost_body: f32, pitches: &[f32]) -> us
         ghost_body,
         pitches,
         None,
-        widgets::INSERT_HYSTERESIS,
+        card::INSERT_HYSTERESIS,
         0,
         0.0,
     )
@@ -334,8 +333,8 @@ struct SqueezeOverlayBox {
 
 fn squeeze_overlay_box(list_width: f32) -> SqueezeOverlayBox {
     SqueezeOverlayBox {
-        left: widgets::COLUMN_PAD_X,
-        width: widgets::displayed_card_width(list_width),
+        left: card_section::COLUMN_PAD_X,
+        width: card::displayed_card_width(list_width),
     }
 }
 
@@ -915,8 +914,8 @@ impl UI_Controls {
         let status = self.snapshot.cards[index].status;
         let card = &self.snapshot.cards[index];
         let inner = self.card_inner_width(status);
-        let body = widgets::card_body_height(&card.title, &card.notes, inner);
-        let pitch = body + widgets::SLOT_GAP;
+        let body = card::card_body_height(&card.title, &card.notes, inner);
+        let pitch = body + card::SLOT_GAP;
         let width = self.ghost_size_for(status).0;
         let before_id = self.snapshot
             .cards
@@ -956,7 +955,7 @@ impl UI_Controls {
 
     fn ghost_size_for(&self, status: Status) -> (f32, f32) {
         let width_of = |s: Status| {
-            widgets::displayed_card_width(f32::from(
+            card::displayed_card_width(f32::from(
                 self.column_scroll[status_key(s) as usize]
                     .bounds()
                     .size
@@ -972,7 +971,7 @@ impl UI_Controls {
             .dragging
             .as_ref()
             .map(|d| d.body)
-            .unwrap_or(widgets::SLOT_BODY);
+            .unwrap_or(card::SLOT_BODY);
         (width, body)
     }
 
@@ -986,7 +985,7 @@ impl UI_Controls {
     }
 
     fn card_inner_width(&self, _status: Status) -> f32 {
-        widgets::shared_inner_width(&[
+        card::shared_inner_width(&[
             self.list_width(Status::Todo),
             self.list_width(Status::Doing),
             self.list_width(Status::Done),
@@ -999,7 +998,7 @@ impl UI_Controls {
             .iter()
             .filter(|card| card.status == status)
             .filter(|card| self.dragging.as_ref().map(|d| d.id.as_str()) != Some(card.id.as_str()))
-            .map(|card| widgets::card_pitch(&card.title, &card.notes, inner))
+            .map(|card| card::card_pitch(&card.title, &card.notes, inner))
             .collect()
     }
 
@@ -1007,14 +1006,14 @@ impl UI_Controls {
         self.dragging
             .as_ref()
             .map(|d| d.body)
-            .unwrap_or(widgets::SLOT_BODY)
+            .unwrap_or(card::SLOT_BODY)
     }
 
     fn drag_pitch(&self) -> f32 {
         self.dragging
             .as_ref()
             .map(|d| d.pitch)
-            .unwrap_or(widgets::SLOT_PITCH)
+            .unwrap_or(card::SLOT_PITCH)
     }
 
     pub fn note_pointer(&mut self, x: f32, y: f32) {
@@ -1208,7 +1207,7 @@ impl UI_Controls {
             self.drag_body(),
             &pitches,
             last,
-            widgets::INSERT_HYSTERESIS,
+            card::INSERT_HYSTERESIS,
             hole_index,
             self.drag_pitch(),
         );
@@ -1443,241 +1442,6 @@ impl UI_Controls {
         }
     }
 
-    fn titlebar(&self, window: &Window, theme: theme::Theme, cx: &mut Context<SM_UI>) -> impl IntoElement {
-        let active = window.is_window_active();
-        let close = if active { 0xff5f57 } else { theme.traffic_dim };
-        let min = if active { 0xfebc2e } else { theme.traffic_dim };
-        let max = if active { 0x28c840 } else { theme.traffic_dim };
-        let pin_bg = theme.pin_bg(self.pinned);
-        let pin_fg = theme.pin_fg(self.pinned);
-        let pin_hover = theme.pin_hover(self.pinned);
-        div()
-            .relative()
-            .flex()
-            .w_full()
-            .h(px(42.))
-            .flex_none()
-            .items_center()
-            .px_3()
-            .border_b_1()
-            .border_color(theme.line())
-            .child(widgets::titlebar_window_title("SunnyMatato", theme))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .pr_2()
-                    .child(widgets::traffic_light("close", Some(WindowControlArea::Close), close))
-                    .child(widgets::traffic_light("min", None, min).on_click(cx.listener(
-                        |_, _, _, cx| {
-                            UI_Inbox_post(UI_Evt::HideToTray);
-                            cx.notify();
-                        },
-                    )))
-                    .child(widgets::traffic_light("max", Some(WindowControlArea::Max), max)),
-            )
-            .child(widgets::titlebar_drag("titlebar-drag"))
-            .child(
-                div()
-                    .id("pin-window")
-                    .w(px(32.))
-                    .h(px(32.))
-                    .rounded_md()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .bg(pin_bg)
-                    .text_color(pin_fg)
-                    .text_xs()
-                    .hover(move |this| this.bg(pin_hover))
-                    .on_click(cx.listener(|_, _, _, cx| {
-                        UI_Inbox_post(UI_Evt::TogglePin);
-                        cx.notify();
-                    }))
-                    .child(if self.pinned { "●" } else { "○" }),
-            )
-    }
-
-    fn move_scrollbar_drag(&mut self, pointer_y: f32) -> bool {
-        let Some(drag) = self.scrollbar_drag.as_ref() else {
-            return false;
-        };
-        let thumb_top = pointer_y - drag.track_top - drag.grab;
-        let scroll_y = widgets::scroll_y_from_thumb_top(
-            thumb_top,
-            drag.viewport,
-            drag.max_scroll,
-            drag.track_h,
-        );
-        let status = drag.status;
-        self.column_scroll[status_key(status) as usize]
-            .set_offset(point(px(0.), px(-scroll_y)));
-        true
-    }
-
-    fn column_scrollbar(
-        &self,
-        status: Status,
-        theme: theme::Theme,
-        cx: &mut Context<SM_UI>,
-    ) -> impl IntoElement {
-        let scroll = &self.column_scroll[status_key(status) as usize];
-        let viewport = f32::from(scroll.bounds().size.height);
-        let max_scroll = f32::from(scroll.max_offset().height);
-        let scroll_y = -f32::from(scroll.offset().y);
-        let Some((top, thumb_h)) =
-            widgets::scrollbar_thumb(viewport, max_scroll, scroll_y, viewport)
-        else {
-            return div().into_any_element();
-        };
-        let track_top = f32::from(scroll.bounds().origin.y);
-        div()
-            .id(("col-scroll", status_key(status)))
-            .absolute()
-            .top_0()
-            .right_0()
-            .w(px(8.))
-            .h_full()
-            .occlude()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                    let y = f32::from(ev.position.y) - track_top;
-                    if y >= top && y <= top + thumb_h {
-                        this.scrollbar_drag = Some(ScrollbarDrag {
-                            status,
-                            track_top,
-                            track_h: viewport,
-                            grab: (y - top).clamp(0.0, thumb_h),
-                            viewport,
-                            max_scroll,
-                        });
-                    } else {
-                        let scroll_y = widgets::scroll_y_from_thumb_top(
-                            y - thumb_h / 2.0,
-                            viewport,
-                            max_scroll,
-                            viewport,
-                        );
-                        this.column_scroll[status_key(status) as usize]
-                            .set_offset(point(px(0.), px(-scroll_y)));
-                    }
-                    cx.notify();
-                }),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top(px(top))
-                    .right(px(1.))
-                    .w(px(6.))
-                    .h(px(thumb_h))
-                    .rounded(px(3.))
-                    .bg(theme.line_strong()),
-            )
-            .into_any_element()
-    }
-
-    fn render_column(
-        &self,
-        title: &'static str,
-        status: Status,
-        theme: theme::Theme,
-        cx: &mut Context<SM_UI>,
-    ) -> impl IntoElement {
-        let count = self.cards_in(status).len();
-        let mut kids = Vec::new();
-        for item in self.column_items(status) {
-            kids.push(match item {
-                ColumnItem::Hole { epoch, phase } => {
-                    self.hole_element(epoch, phase, theme, cx).into_any_element()
-                }
-                ColumnItem::Card(card) => {
-                    self.card_element(card, status, theme, cx).into_any_element()
-                }
-            });
-        }
-        kids.push(self.append_slot(status, cx).into_any_element());
-        for overlay in self.squeeze_overlays_in(status, theme) {
-            kids.push(overlay);
-        }
-        let scroll = self.column_scroll[status_key(status) as usize].clone();
-        let list = div()
-            .id(title)
-            .relative()
-            .flex()
-            .flex_col()
-            .size_full()
-            .min_h_0()
-            .px_3()
-            .pb_3()
-            .overflow_y_scroll()
-            .track_scroll(&scroll)
-            .on_drag_move(cx.listener(
-                move |this, event: &DragMoveEvent<DragCard>, _, cx| {
-                    if this.dragging.is_none() {
-                        return;
-                    }
-                    this.note_pointer(
-                        f32::from(event.event.position.x),
-                        f32::from(event.event.position.y),
-                    );
-                    if !event.bounds.contains(&event.event.position) {
-                        return;
-                    }
-                    let local = event.event.position.y - event.bounds.origin.y;
-                    let scrolled =
-                        this.column_scroll[status_key(status) as usize].offset().y;
-                    let y = f32::from(local - scrolled);
-                    this.note_drag_geometry(
-                        f32::from(event.event.position.x),
-                        f32::from(event.event.position.y),
-                        f32::from(event.bounds.origin.x),
-                        f32::from(event.bounds.origin.y),
-                        f32::from(scrolled),
-                    );
-                    this.note_column_frame(
-                        status,
-                        f32::from(event.bounds.origin.x),
-                        f32::from(event.bounds.origin.y),
-                        f32::from(scrolled),
-                    );
-                    if this.hover_pointer(status, y) {
-                        cx.notify();
-                    }
-                },
-            ))
-            .children(kids);
-        let body = div()
-            .relative()
-            .flex()
-            .flex_1()
-            .min_h_0()
-            .child(list)
-            .child(self.column_scrollbar(status, theme, cx));
-        widgets::Column(title, count, body, theme)
-            .drag_over::<DragCard>({
-                let gold_soft = theme.gold_soft();
-                move |style, _, _, _| style.bg(gold_soft)
-            })
-            .on_drop(cx.listener(move |this, info: &DragCard, window, cx| {
-                let pointer = window.mouse_position();
-                this.note_pointer(f32::from(pointer.x), f32::from(pointer.y));
-                let hovered_here = this
-                    .dragging
-                    .as_ref()
-                    .is_some_and(|d| d.to_status == status);
-                if hovered_here {
-                    this.commit_drop();
-                } else {
-                    this.drop_card(&info.card.id, status, None);
-                }
-                cx.notify();
-            }))
-    }
-
     fn card_element(
         &self,
         card: &Card,
@@ -1692,15 +1456,15 @@ impl UI_Controls {
         let view = cx.entity().downgrade();
         let hidden = self.card_is_hidden(&id);
         let inner = self.card_inner_width(status);
-        let body = widgets::card_body_height(&card.title, &card.notes, inner);
-        let pitch = body + widgets::SLOT_GAP;
+        let body = card::card_body_height(&card.title, &card.notes, inner);
+        let pitch = body + card::SLOT_GAP;
         let tile = div()
             .w_full()
             .flex_none()
             .h(px(body))
             .min_h(px(body))
             .opacity(if hidden { 0. } else { 1. })
-            .child(widgets::CardTile(card, theme));
+            .child(card::render(card, theme));
         div()
             .id(("card", hash_id(&id)))
             .w_full()
@@ -1797,7 +1561,7 @@ impl UI_Controls {
                         this.commit_drop();
                         cx.notify();
                     }))
-                    .child(widgets::Hole(theme, body))
+                    .child(card::placeholder(theme, body))
                     .into_any_element()
             }
             HolePhase::Open | HolePhase::Close => div()
@@ -1812,7 +1576,7 @@ impl UI_Controls {
                     this.commit_drop();
                     cx.notify();
                 }))
-                .child(widgets::Hole(theme, body))
+                .child(card::placeholder(theme, body))
                 .with_animation(
                     id,
                     Animation::new(Duration::from_millis(HOLE_ANIM_MS)).with_easing(ease_in_out),
@@ -1860,7 +1624,7 @@ impl UI_Controls {
                 let card = self.snapshot.cards.iter().find(|card| card.id == slide.id)?;
                 let from_y = slide.from_y;
                 let to_y = slide.to_y;
-                let body = widgets::card_body_height(&card.title, &card.notes, inner);
+                let body = card::card_body_height(&card.title, &card.notes, inner);
                 let id = (
                     "card-slide",
                     slide
@@ -1884,7 +1648,7 @@ impl UI_Controls {
                             .h(px(body))
                             .overflow_hidden(),
                     )
-                    .child(widgets::CardTile(card, theme))
+                    .child(card::render(card, theme))
                     .with_animation(
                         id,
                         Animation::new(Duration::from_millis(HOLE_ANIM_MS))
@@ -1919,14 +1683,14 @@ impl UI_Controls {
                 let mut element = div()
                     .id(id)
                     .w(px(width))
-                    .h(px(widgets::card_body_height(
+                    .h(px(card::card_body_height(
                         &card.title,
                         &card.notes,
-                        (width - widgets::COLUMN_PAD_X * 2.0).max(0.0),
+                        (width - card_section::COLUMN_PAD_X * 2.0).max(0.0),
                     )))
                     .overflow_hidden()
                     .opacity(0.7 + 0.3 * delta)
-                    .child(widgets::CardTile(&card, theme))
+                    .child(card::render(&card, theme))
                     .into_any_element();
                 element.prepaint_as_root(origin, gpui::AvailableSpace::min_size(), window, cx);
                 element
@@ -1938,475 +1702,6 @@ impl UI_Controls {
         .into_any_element()
     }
 
-    fn editor_overlay(&self, theme: theme::Theme, cx: &mut Context<SM_UI>) -> impl IntoElement {
-        let Some(editor) = &self.editor else {
-            return div().into_any_element();
-        };
-        let heading = match &editor.kind {
-            card_editor::EditorKind::Create => "新建卡片",
-            card_editor::EditorKind::Edit { .. } => "编辑卡片",
-        };
-        let can_delete = matches!(editor.kind, card_editor::EditorKind::Edit { .. });
-        let hour = editor.hour;
-        let minute = editor.minute;
-        let has_date = !editor.deadline.is_empty();
-        let priority = editor.priority;
-        let error = editor.error.clone();
-        let mut form = div()
-            .id("card-editor")
-            .w(px(440.))
-            .max_w(px(440.))
-            .min_w_0()
-            .overflow_hidden()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .rounded(px(20.))
-            .border_1()
-            .border_color(theme.line())
-            .bg(theme.card())
-            .p(px(28.))
-            .occlude()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(|_, _, cx| cx.stop_propagation())
-            .child(div().text_xl().child(heading))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .min_w_0()
-                    .child(div().text_xs().text_color(theme.ink_soft()).child("标题"))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .children(self.title_field.clone()),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .min_w_0()
-                    .child(div().text_xs().text_color(theme.ink_soft()).child("备注"))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .children(self.notes_field.clone()),
-                    ),
-            )
-            .child({
-                let mut deadline = div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .min_w_0()
-                    .child(div().text_xs().text_color(theme.ink_soft()).child("截止日期"))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .min_w_0()
-                            .child(date_trigger(&editor.deadline, theme, cx))
-                            .child(hour_stepper(hour, minute, has_date, theme, cx)),
-                    );
-                if self.calendar_open {
-                    deadline = deadline.child(month_calendar(
-                        self.calendar_year,
-                        self.calendar_month,
-                        calendar::ymd_from_date_string(&editor.deadline),
-                        theme,
-                        cx,
-                    ));
-                }
-                deadline
-            })
-            .child(priority_row(priority, theme, cx));
-        if let Some(error) = error {
-            form = form.child(div().text_xs().text_color(theme.danger()).child(error));
-        }
-        form = form.child(editor_actions(can_delete, theme, cx));
-        div()
-            .id("editor-backdrop")
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(theme.backdrop())
-            .occlude()
-            .on_click(cx.listener(|_, _, _, cx| {
-                UI_Inbox_post(UI_Evt::CancelEditor);
-                cx.notify();
-            }))
-            .child(form)
-            .into_any_element()
-    }
-}
-
-fn date_trigger(
-    deadline: &str,
-    theme: theme::Theme,
-    cx: &mut Context<SM_UI>,
-) -> impl IntoElement {
-    let label = if deadline.is_empty() {
-        "选择日期".to_string()
-    } else {
-        deadline.to_string()
-    };
-    let muted = deadline.is_empty();
-    div()
-        .id("deadline-date")
-        .flex_1()
-        .min_w_0()
-        .h(px(36.))
-        .px_3()
-        .rounded_lg()
-        .border_1()
-        .border_color(theme.line_strong())
-        .flex()
-        .items_center()
-        .justify_between()
-        .cursor_pointer()
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.calendar_open = !this.calendar_open;
-            if this.calendar_open {
-                this.sync_calendar_month();
-            }
-            cx.notify();
-        }))
-        .child(
-            div()
-                .text_sm()
-                .text_color(if muted {
-                    theme.ink_faint()
-                } else {
-                    theme.ink()
-                })
-                .child(label),
-        )
-        .child(
-            div()
-                .id("deadline-clear")
-                .text_xs()
-                .text_color(theme.ink_faint())
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    if let Some(editor) = &mut this.editor {
-                        editor.deadline.clear();
-                    }
-                    this.calendar_open = false;
-                    cx.notify();
-                }))
-                .child(if muted { "" } else { "清除" }),
-        )
-}
-
-fn month_calendar(
-    year: i32,
-    month: u32,
-    selected: Option<calendar::Ymd>,
-    theme: theme::Theme,
-    cx: &mut Context<SM_UI>,
-) -> impl IntoElement {
-    let cells = calendar::month_cells(year, month);
-    let heading = format!("{year}年{month}月");
-    let weekdays = ["一", "二", "三", "四", "五", "六", "日"];
-    let mut grid = div().flex().flex_col().gap_1();
-    let mut header = div().flex();
-    for day in weekdays {
-        header = header.child(
-            div()
-                .flex_1()
-                .text_center()
-                .text_xs()
-                .text_color(theme.ink_faint())
-                .child(day),
-        );
-    }
-    grid = grid.child(header);
-    for week in 0..6 {
-        let mut row = div().flex();
-        for col in 0..7 {
-            let cell = cells[week * 7 + col];
-            row = row.child(day_cell(cell, selected, theme, cx));
-        }
-        grid = grid.child(row);
-    }
-    div()
-        .mt_1()
-        .p_2()
-        .rounded_lg()
-        .border_1()
-        .border_color(theme.line())
-        .bg(theme.card())
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .pb_2()
-                .child(step_btn("cal-prev", "‹", true, theme, cx, |this| {
-                    let (y, m) = calendar::shift_month(this.calendar_year, this.calendar_month, -1);
-                    this.calendar_year = y;
-                    this.calendar_month = m;
-                }))
-                .child(div().text_sm().child(heading))
-                .child(step_btn("cal-next", "›", true, theme, cx, |this| {
-                    let (y, m) = calendar::shift_month(this.calendar_year, this.calendar_month, 1);
-                    this.calendar_year = y;
-                    this.calendar_month = m;
-                })),
-        )
-        .child(grid)
-}
-
-fn day_cell(
-    cell: calendar::MonthCell,
-    selected: Option<calendar::Ymd>,
-    theme: theme::Theme,
-    cx: &mut Context<SM_UI>,
-) -> impl IntoElement {
-    let on = selected == Some(cell.ymd);
-    let fg = if !cell.in_month {
-        theme.ink_faint()
-    } else if on {
-        theme.on_primary()
-    } else {
-        theme.ink()
-    };
-    let bg = if on { theme.gold() } else { theme.card() };
-    let ymd = cell.ymd;
-    div()
-        .id(("cal-day", (ymd.year as u64) << 16 | (ymd.month as u64) << 8 | ymd.day as u64))
-        .flex_1()
-        .h(px(28.))
-        .rounded_md()
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_xs()
-        .text_color(fg)
-        .bg(bg)
-        .cursor_pointer()
-        .on_click(cx.listener(move |this, _, _, cx| {
-            if let Some(editor) = &mut this.editor {
-                editor.deadline = calendar::date_string_from_ymd(ymd);
-            }
-            this.calendar_year = ymd.year;
-            this.calendar_month = ymd.month;
-            this.calendar_open = false;
-            cx.notify();
-        }))
-        .child(format!("{}", ymd.day))
-}
-
-fn hour_stepper(
-    hour: u32,
-    minute: u32,
-    enabled: bool,
-    theme: theme::Theme,
-    cx: &mut Context<SM_UI>,
-) -> impl IntoElement {
-    let label = format!("{hour:02}:{minute:02}");
-    div()
-        .flex()
-        .items_center()
-        .gap_1()
-        .opacity(if enabled { 1. } else { 0.45 })
-        .child(step_btn("hour-dec", "−", enabled, theme, cx, |this| {
-            if let Some(editor) = &mut this.editor {
-                let (hour, minute) = card_meta::step_half_hour(editor.hour, editor.minute, -1);
-                editor.hour = hour;
-                editor.minute = minute;
-            }
-        }))
-        .child(
-            div()
-                .w(px(56.))
-                .text_center()
-                .text_sm()
-                .child(label),
-        )
-        .child(step_btn("hour-inc", "+", enabled, theme, cx, |this| {
-            if let Some(editor) = &mut this.editor {
-                let (hour, minute) = card_meta::step_half_hour(editor.hour, editor.minute, 1);
-                editor.hour = hour;
-                editor.minute = minute;
-            }
-        }))
-}
-
-fn step_btn(
-    id: &'static str,
-    label: &'static str,
-    enabled: bool,
-    theme: theme::Theme,
-    cx: &mut Context<SM_UI>,
-    on_press: impl Fn(&mut SM_UI) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .w(px(28.))
-        .h(px(28.))
-        .rounded_md()
-        .flex()
-        .items_center()
-        .justify_center()
-        .border_1()
-        .border_color(theme.line_strong())
-        .cursor_pointer()
-        .on_click(cx.listener(move |this, _, _, cx| {
-            if enabled {
-                on_press(this);
-                cx.notify();
-            }
-        }))
-        .child(label)
-}
-
-fn priority_row(
-    selected: Priority,
-    theme: theme::Theme,
-    cx: &mut Context<SM_UI>,
-) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(div().text_xs().text_color(theme.ink_soft()).child("优先级"))
-        .child(
-            div()
-                .flex()
-                .gap_2()
-                .child(priority_choice(
-                    "prio-low",
-                    "低",
-                    Priority::Low,
-                    selected,
-                    theme,
-                    cx,
-                ))
-                .child(priority_choice(
-                    "prio-med",
-                    "中",
-                    Priority::Medium,
-                    selected,
-                    theme,
-                    cx,
-                ))
-                .child(priority_choice(
-                    "prio-high",
-                    "高",
-                    Priority::High,
-                    selected,
-                    theme,
-                    cx,
-                )),
-        )
-}
-
-fn priority_choice(
-    id: &'static str,
-    label: &'static str,
-    value: Priority,
-    selected: Priority,
-    theme: theme::Theme,
-    cx: &mut Context<SM_UI>,
-) -> impl IntoElement {
-    let on = selected == value;
-    let (fg, bg) = if on {
-        theme.priority_tag(value)
-    } else {
-        (theme.ink(), theme.clear())
-    };
-    let border = if on {
-        theme.clear()
-    } else {
-        theme.line_strong()
-    };
-    div()
-        .id(id)
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .border_1()
-        .border_color(border)
-        .bg(bg)
-        .text_color(fg)
-        .text_xs()
-        .cursor_pointer()
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.set_editor_priority(value);
-            cx.notify();
-        }))
-        .child(label)
-}
-
-fn editor_actions(
-    can_delete: bool,
-    theme: theme::Theme,
-    cx: &mut Context<SM_UI>,
-) -> impl IntoElement {
-    let mut row = div().flex().items_center().gap_2().pt_2();
-    if can_delete {
-        row = row.child(
-            div()
-                .id("editor-delete")
-                .flex_1()
-                .text_xs()
-                .text_color(theme.danger())
-                .cursor_pointer()
-                .on_click(cx.listener(|_, _, _, cx| {
-                    UI_Inbox_post(UI_Evt::DeleteEditor);
-                    cx.notify();
-                }))
-                .child("删除"),
-        );
-    } else {
-        row = row.child(div().flex_1());
-    }
-    row.child(
-        div()
-            .id("editor-cancel")
-            .px_3()
-            .py_1()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.line_strong())
-            .text_xs()
-            .cursor_pointer()
-            .on_click(cx.listener(|_, _, _, cx| {
-                UI_Inbox_post(UI_Evt::CancelEditor);
-                cx.notify();
-            }))
-            .child("取消"),
-    )
-    .child(
-        div()
-            .id("editor-save")
-            .px_3()
-            .py_1()
-            .rounded_md()
-            .bg(theme.gold())
-            .text_color(theme.on_primary())
-            .text_xs()
-            .cursor_pointer()
-            .on_click(cx.listener(|_, _, _, cx| {
-                UI_Inbox_post(UI_Evt::SaveEditor);
-                cx.notify();
-            }))
-            .child("保存"),
-    )
 }
 
 impl Render for SM_UI {
@@ -2481,7 +1776,7 @@ impl UI_Controls {
                     cx.notify();
                 }),
             )
-            .child(self.titlebar(window, theme, cx))
+            .child(self.render_titlebar(window, theme, cx))
             .child(
                 div()
                     .flex()
@@ -2492,41 +1787,8 @@ impl UI_Controls {
                     .py_4()
                     .border_b_1()
                     .border_color(theme.line())
-                    .child(div().text_xl().text_color(theme.gold()).child("TODO"))
-                    .child(
-                        div()
-                            .id("add-card")
-                            .relative()
-                            .size(px(32.))
-                            .rounded(px(16.))
-                            .bg(theme.gold())
-                            .cursor_pointer()
-                            .hover(|this| this.bg(theme.gold_hover()))
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                UI_Inbox_post(UI_Evt::NewCard);
-                                cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(px(9.5))
-                                    .top(px(14.8))
-                                    .w(px(13.))
-                                    .h(px(2.4))
-                                    .rounded(px(1.2))
-                                    .bg(theme.on_primary()),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(px(14.8))
-                                    .top(px(9.5))
-                                    .w(px(2.4))
-                                    .h(px(13.))
-                                    .rounded(px(1.2))
-                                    .bg(theme.on_primary()),
-                            ),
-                    )
+                    .child(title::board_title(theme))
+                    .child(add_card_button::render(theme, cx))
                     .child(self.persistence_status(theme, cx)),
             )
             .child(
@@ -2536,12 +1798,12 @@ impl UI_Controls {
                     .min_h_0()
                     .gap_4()
                     .p_6()
-                    .child(self.render_column("待办", Status::Todo, theme, cx))
-                    .child(self.render_column("进行中", Status::Doing, theme, cx))
-                    .child(self.render_column("完成", Status::Done, theme, cx)),
+                    .child(self.render_card_section("待办", Status::Todo, theme, cx))
+                    .child(self.render_card_section("进行中", Status::Doing, theme, cx))
+                    .child(self.render_card_section("完成", Status::Done, theme, cx)),
             )
             .child(self.settle_overlay(window, theme))
-            .child(self.editor_overlay(theme, cx))
+            .child(self.render_card_editor(theme, cx))
     }
 }
 
@@ -2845,7 +2107,7 @@ mod tests {
         assert_eq!(column_marks(&sm, Status::Todo), vec!["B", "□", "C"]);
         assert_eq!(
             squeeze_offsets(&sm),
-            vec![("B".to_string(), widgets::SLOT_PITCH)]
+            vec![("B".to_string(), card::SLOT_PITCH)]
         );
         assert_eq!(squeeze_paths(&sm), vec![("B".to_string(), 1, 0)]);
     }
@@ -2868,7 +2130,7 @@ mod tests {
         assert_eq!(todo_holes.len(), 1);
         assert_eq!(
             squeeze_offsets(&sm),
-            vec![("A".to_string(), -widgets::SLOT_PITCH)]
+            vec![("A".to_string(), -card::SLOT_PITCH)]
         );
     }
 
@@ -2883,7 +2145,7 @@ mod tests {
         sm.hover_insert(Status::Todo, Some(&todo[2]));
         assert_eq!(
             sm.squeeze_overlay_from_to(),
-            vec![(widgets::SLOT_PITCH, 0.0)]
+            vec![(card::SLOT_PITCH, 0.0)]
         );
         assert!(sm.card_is_hidden(&todo[1]));
     }
@@ -2895,8 +2157,8 @@ mod tests {
         sm.add_todo_card("B");
         sm.add_todo_card("C");
         sm.snapshot.cards[0].notes = "a\nb\nc\nd".to_string();
-        let tall = widgets::card_pitch("Tall", "a\nb\nc\nd", 0.0);
-        assert!(tall > widgets::SLOT_PITCH);
+        let tall = card::card_pitch("Tall", "a\nb\nc\nd", 0.0);
+        assert!(tall > card::SLOT_PITCH);
         let todo = ids(&sm, Status::Todo);
         sm.start_drag(&todo[0]);
         sm.hover_insert(Status::Todo, Some(&todo[2]));
@@ -2907,27 +2169,27 @@ mod tests {
     fn squeeze_overlay_width_matches_displayed_card() {
         let list_width = 360.0;
         let box_ = squeeze_overlay_box(list_width);
-        assert_eq!(box_.left, widgets::COLUMN_PAD_X);
-        assert_eq!(box_.width, widgets::displayed_card_width(list_width));
-        assert_eq!(box_.left + box_.width + widgets::COLUMN_PAD_X, list_width);
+        assert_eq!(box_.left, card_section::COLUMN_PAD_X);
+        assert_eq!(box_.width, card::displayed_card_width(list_width));
+        assert_eq!(box_.left + box_.width + card_section::COLUMN_PAD_X, list_width);
         assert!(box_.width < list_width);
     }
 
     #[test]
     fn paired_open_close_holes_share_one_slot_of_height() {
         for delta in [0.0, 0.25, 0.5, 0.75, 1.0] {
-            let open = hole_box(HolePhase::Open, delta, widgets::SLOT_PITCH);
-            let close = hole_box(HolePhase::Close, delta, widgets::SLOT_PITCH);
-            assert_eq!(open.height + close.height, widgets::SLOT_PITCH);
+            let open = hole_box(HolePhase::Open, delta, card::SLOT_PITCH);
+            let close = hole_box(HolePhase::Close, delta, card::SLOT_PITCH);
+            assert_eq!(open.height + close.height, card::SLOT_PITCH);
             assert_eq!(open.min_height, 0.0);
             assert_eq!(close.min_height, 0.0);
             assert_eq!(open.max_height, open.height);
             assert_eq!(close.max_height, close.height);
         }
-        let hold = hole_box(HolePhase::Hold, 0.0, widgets::SLOT_PITCH);
-        assert_eq!(hold.height, widgets::SLOT_PITCH);
-        assert_eq!(hold.min_height, widgets::SLOT_PITCH);
-        assert_eq!(hold.max_height, widgets::SLOT_PITCH);
+        let hold = hole_box(HolePhase::Hold, 0.0, card::SLOT_PITCH);
+        assert_eq!(hold.height, card::SLOT_PITCH);
+        assert_eq!(hold.min_height, card::SLOT_PITCH);
+        assert_eq!(hold.max_height, card::SLOT_PITCH);
     }
 
     #[test]
@@ -2949,25 +2211,25 @@ mod tests {
     #[test]
     fn slot_pitch_is_card_body_plus_column_gap() {
         assert_eq!(
-            widgets::SLOT_PITCH,
-            widgets::SLOT_BODY + widgets::SLOT_GAP
+            card::SLOT_PITCH,
+            card::SLOT_BODY + card::SLOT_GAP
         );
         assert_eq!(
-            widgets::SLOT_BODY,
-            widgets::SLOT_PAD_Y * 2.0
-                + widgets::SLOT_BORDER_Y * 2.0
-                + widgets::SLOT_FACE
+            card::SLOT_BODY,
+            card::SLOT_PAD_Y * 2.0
+                + card::SLOT_BORDER_Y * 2.0
+                + card::SLOT_FACE
         );
         assert_eq!(
-            widgets::SLOT_FACE,
-            widgets::SLOT_TITLE + widgets::SLOT_MARKS_GAP + widgets::SLOT_MARKS
+            card::SLOT_FACE,
+            card::SLOT_TITLE + card::SLOT_MARKS_GAP + card::SLOT_MARKS
         );
-        assert_eq!(widgets::SLOT_GAP, 8.0);
+        assert_eq!(card::SLOT_GAP, 8.0);
     }
 
     #[test]
     fn ghost_covering_dest_mids_steps_the_nearest_slot() {
-        let n = vec![widgets::SLOT_PITCH; 3];
+        let n = vec![card::SLOT_PITCH; 3];
         let ghost_body = 200.0;
         assert_eq!(
             resolve_insert_from_ghost(
@@ -2975,21 +2237,21 @@ mod tests {
                 ghost_body,
                 &n,
                 None,
-                widgets::INSERT_HYSTERESIS,
+                card::INSERT_HYSTERESIS,
                 0,
-                widgets::SLOT_PITCH,
+                card::SLOT_PITCH,
             ),
             1
         );
         assert_eq!(
             resolve_insert_from_ghost(
                 0.0,
-                widgets::SLOT_BODY,
+                card::SLOT_BODY,
                 &n,
                 None,
-                widgets::INSERT_HYSTERESIS,
+                card::INSERT_HYSTERESIS,
                 0,
-                widgets::SLOT_PITCH,
+                card::SLOT_PITCH,
             ),
             0
         );
@@ -2997,25 +2259,25 @@ mod tests {
 
     #[test]
     fn thin_overlap_does_not_squeeze() {
-        let n = vec![widgets::SLOT_PITCH; 2];
-        let ghost_top = widgets::SLOT_PITCH + widgets::SLOT_BODY - 1.0;
+        let n = vec![card::SLOT_PITCH; 2];
+        let ghost_top = card::SLOT_PITCH + card::SLOT_BODY - 1.0;
         assert_eq!(
-            raw_insert_from_ghost(ghost_top, widgets::SLOT_BODY, &n),
+            raw_insert_from_ghost(ghost_top, card::SLOT_BODY, &n),
             0
         );
     }
 
     #[test]
     fn ghost_top_past_dest_mid_squeezes_from_below() {
-        let n = vec![widgets::SLOT_PITCH; 2];
-        let hole_pitch = widgets::SLOT_PITCH;
+        let n = vec![card::SLOT_PITCH; 2];
+        let hole_pitch = card::SLOT_PITCH;
         assert_eq!(
             resolve_insert_from_ghost(
-                squeeze_up_y(widgets::SLOT_PITCH),
-                widgets::SLOT_BODY,
+                squeeze_up_y(card::SLOT_PITCH),
+                card::SLOT_BODY,
                 &n,
                 Some(2),
-                widgets::INSERT_HYSTERESIS,
+                card::INSERT_HYSTERESIS,
                 2,
                 hole_pitch,
             ),
@@ -3025,26 +2287,26 @@ mod tests {
 
     #[test]
     fn ghost_bottom_contact_inserts_after() {
-        let n = vec![widgets::SLOT_PITCH; 2];
+        let n = vec![card::SLOT_PITCH; 2];
         let ghost_top = 1.0;
         assert_eq!(
-            raw_insert_from_ghost(ghost_top, widgets::SLOT_BODY, &n),
+            raw_insert_from_ghost(ghost_top, card::SLOT_BODY, &n),
             1
         );
     }
 
     #[test]
     fn upward_volume_keeps_moving_from_last_slot() {
-        let n = vec![widgets::SLOT_PITCH; 2];
+        let n = vec![card::SLOT_PITCH; 2];
         assert_eq!(
             resolve_insert_from_ghost(
                 squeeze_up_y(0.0),
-                widgets::SLOT_BODY,
+                card::SLOT_BODY,
                 &n,
                 Some(1),
-                widgets::INSERT_HYSTERESIS,
+                card::INSERT_HYSTERESIS,
                 1,
-                widgets::SLOT_PITCH,
+                card::SLOT_PITCH,
             ),
             0
         );
@@ -3052,13 +2314,13 @@ mod tests {
 
     #[test]
     fn downward_thin_overlap_below_hole_does_not_squeeze() {
-        let n = vec![widgets::SLOT_PITCH; 2];
-        let hole_pitch = widgets::SLOT_PITCH;
-        let ghost_top = hole_pitch - widgets::SLOT_BODY + 1.0;
+        let n = vec![card::SLOT_PITCH; 2];
+        let hole_pitch = card::SLOT_PITCH;
+        let ghost_top = hole_pitch - card::SLOT_BODY + 1.0;
         assert_eq!(
             resolve_insert_from_ghost(
                 ghost_top,
-                widgets::SLOT_BODY,
+                card::SLOT_BODY,
                 &n,
                 Some(0),
                 3.0,
@@ -3071,13 +2333,13 @@ mod tests {
 
     #[test]
     fn downward_half_overlap_below_hole_squeezes() {
-        let n = vec![widgets::SLOT_PITCH; 2];
-        let hole_pitch = widgets::SLOT_PITCH;
+        let n = vec![card::SLOT_PITCH; 2];
+        let hole_pitch = card::SLOT_PITCH;
         let ghost_top = squeeze_down_y(hole_pitch);
         assert_eq!(
             resolve_insert_from_ghost(
                 ghost_top,
-                widgets::SLOT_BODY,
+                card::SLOT_BODY,
                 &n,
                 Some(0),
                 3.0,
@@ -3090,13 +2352,13 @@ mod tests {
 
     #[test]
     fn ghost_insert_skips_hysteresis_when_index_jumps() {
-        let n = vec![widgets::SLOT_PITCH; 3];
+        let n = vec![card::SLOT_PITCH; 3];
         assert_eq!(
-            resolve_insert_from_ghost(0.0, widgets::SLOT_BODY, &n, Some(2), 3.0, usize::MAX, 0.0),
+            resolve_insert_from_ghost(0.0, card::SLOT_BODY, &n, Some(2), 3.0, usize::MAX, 0.0),
             0
         );
         assert_eq!(
-            resolve_insert_from_ghost(10.0, widgets::SLOT_BODY, &[], None, 3.0, usize::MAX, 0.0),
+            resolve_insert_from_ghost(10.0, card::SLOT_BODY, &[], None, 3.0, usize::MAX, 0.0),
             0
         );
     }
@@ -3132,7 +2394,7 @@ mod tests {
         sm.hover_pointer(Status::Todo, 90.0);
         let from_top = column_marks(&sm, Status::Todo);
         sm.start_drag(&todo[0]);
-        sm.set_grab_offset(0.0, widgets::SLOT_BODY - 1.0);
+        sm.set_grab_offset(0.0, card::SLOT_BODY - 1.0);
         sm.hover_pointer(Status::Todo, 90.0);
         let from_bottom = column_marks(&sm, Status::Todo);
         assert_ne!(from_top, from_bottom);
@@ -3147,7 +2409,7 @@ mod tests {
         let todo = ids(&sm, Status::Todo);
         sm.start_drag(&todo[2]);
         sm.set_grab_offset(0.0, 0.0);
-        let y = squeeze_up_y(widgets::SLOT_PITCH);
+        let y = squeeze_up_y(card::SLOT_PITCH);
         assert!(sm.hover_pointer(Status::Todo, y));
         assert_eq!(column_marks(&sm, Status::Todo), vec!["A", "□", "B"]);
     }
@@ -3161,7 +2423,7 @@ mod tests {
         let todo = ids(&sm, Status::Todo);
         sm.start_drag(&todo[2]);
         sm.set_grab_offset(0.0, 0.0);
-        assert!(sm.hover_pointer(Status::Todo, squeeze_up_y(widgets::SLOT_PITCH)));
+        assert!(sm.hover_pointer(Status::Todo, squeeze_up_y(card::SLOT_PITCH)));
         assert_eq!(column_marks(&sm, Status::Todo), vec!["A", "□", "B"]);
         assert!(sm.hover_pointer(Status::Todo, squeeze_up_y(0.0)));
         assert_eq!(column_marks(&sm, Status::Todo), vec!["□", "A", "B"]);
@@ -3176,7 +2438,7 @@ mod tests {
         let id = ids(&sm, Status::Todo)[0].clone();
         sm.start_drag(&id);
         sm.set_grab_offset(0.0, 0.0);
-        let y = widgets::SLOT_PITCH - widgets::SLOT_BODY + 1.0;
+        let y = card::SLOT_PITCH - card::SLOT_BODY + 1.0;
         sm.hover_pointer(Status::Todo, y);
         assert_eq!(column_marks(&sm, Status::Todo), vec!["□", "B", "C"]);
     }
@@ -3192,18 +2454,18 @@ mod tests {
         sm.set_grab_offset(0.0, 0.0);
         assert!(sm.hover_pointer(
             Status::Todo,
-            squeeze_down_y(widgets::SLOT_PITCH)
+            squeeze_down_y(card::SLOT_PITCH)
         ));
         assert_eq!(column_marks(&sm, Status::Todo), vec!["B", "□", "C"]);
     }
 
     #[test]
     fn ghost_bottom_must_pass_dest_mid_by_hysteresis_to_squeeze_down() {
-        let n = vec![widgets::SLOT_PITCH; 2];
-        let hole_pitch = widgets::SLOT_PITCH;
-        let dest_mid = hole_pitch + widgets::SLOT_BODY / 2.0;
-        let h = widgets::INSERT_HYSTERESIS;
-        let ghost_body = widgets::SLOT_BODY;
+        let n = vec![card::SLOT_PITCH; 2];
+        let hole_pitch = card::SLOT_PITCH;
+        let dest_mid = hole_pitch + card::SLOT_BODY / 2.0;
+        let h = card::INSERT_HYSTERESIS;
+        let ghost_body = card::SLOT_BODY;
         assert_eq!(
             resolve_insert_from_ghost(
                 dest_mid - ghost_body,
@@ -3232,11 +2494,11 @@ mod tests {
 
     #[test]
     fn ghost_top_must_pass_dest_mid_by_hysteresis_to_squeeze_up() {
-        let n = vec![widgets::SLOT_PITCH; 2];
-        let hole_pitch = widgets::SLOT_PITCH;
-        let dest_mid = widgets::SLOT_BODY / 2.0;
-        let h = widgets::INSERT_HYSTERESIS;
-        let ghost_body = widgets::SLOT_BODY;
+        let n = vec![card::SLOT_PITCH; 2];
+        let hole_pitch = card::SLOT_PITCH;
+        let dest_mid = card::SLOT_BODY / 2.0;
+        let h = card::INSERT_HYSTERESIS;
+        let ghost_body = card::SLOT_BODY;
         assert_eq!(
             resolve_insert_from_ghost(
                 dest_mid,
@@ -3274,7 +2536,7 @@ mod tests {
         sm.set_grab_offset(0.0, 0.0);
         assert!(sm.hover_pointer(
             Status::Todo,
-            squeeze_down_y(widgets::SLOT_PITCH)
+            squeeze_down_y(card::SLOT_PITCH)
         ));
         assert_eq!(column_marks(&sm, Status::Todo), vec!["B", "□", "C"]);
         assert!(sm.hover_pointer(
@@ -3317,7 +2579,7 @@ mod tests {
         let id = ids(&sm, Status::Todo)[0].clone();
         sm.start_drag(&id);
         sm.set_grab_offset(0.0, 0.0);
-        let y = squeeze_down_y(widgets::SLOT_PITCH);
+        let y = squeeze_down_y(card::SLOT_PITCH);
         assert!(sm.hover_pointer(Status::Todo, y));
         let marks = column_marks(&sm, Status::Todo);
         assert!(!sm.hover_pointer(Status::Todo, y + 1.0));
@@ -3335,12 +2597,12 @@ mod tests {
         sm.set_grab_offset(0.0, 0.0);
         assert!(sm.hover_pointer(
             Status::Todo,
-            squeeze_down_y(widgets::SLOT_PITCH)
+            squeeze_down_y(card::SLOT_PITCH)
         ));
         assert_eq!(column_marks(&sm, Status::Todo), vec!["B", "□", "C"]);
         assert!(sm.hover_pointer(
             Status::Todo,
-            widgets::SLOT_PITCH * 2.0 + widgets::SLOT_BODY
+            card::SLOT_PITCH * 2.0 + card::SLOT_BODY
         ));
         assert_eq!(column_marks(&sm, Status::Todo), vec!["B", "C", "□"]);
     }
@@ -3359,8 +2621,8 @@ mod tests {
     #[test]
     fn slot_origin_y_is_list_plus_index_pitch() {
         assert_eq!(
-            slot_origin_y(40.0, -8.0, 2, &[widgets::SLOT_PITCH; 3]),
-            40.0 - 8.0 + 2.0 * widgets::SLOT_PITCH
+            slot_origin_y(40.0, -8.0, 2, &[card::SLOT_PITCH; 3]),
+            40.0 - 8.0 + 2.0 * card::SLOT_PITCH
         );
     }
 

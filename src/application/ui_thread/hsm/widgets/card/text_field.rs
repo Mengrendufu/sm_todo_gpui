@@ -10,7 +10,7 @@ use gpui::{
     TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 
-use super::theme::Theme;
+use crate::application::ui_thread::hsm::theme::Theme;
 
 actions!(
     card_field,

@@ -13,6 +13,7 @@ use crate::application::ui_thread::thread::inbox::{
     UI_Inbox_bind, UI_Inbox_take_all, UI_Inbox_post,
 };
 use crate::application::ui_thread::hsm::{SM_UI, SM_UI_HostOps};
+use super::super::window_ops::{DispatchResult, ExitProgress, WindowOps};
 
 pub fn RenderRuntime_setup() -> Receiver<()> {
     let (wake_tx, wake_rx) = async_channel::bounded::<()>(1);
@@ -77,30 +78,14 @@ pub fn RenderRuntime_run(wake_rx: Receiver<()>, snapshot: Snapshot, client: Data
             while wake_rx.recv().await.is_ok() {
                 let _ = handle.update(cx, |sm, window, cx| {
                     for e in UI_Inbox_take_all() {
-                        match e {
-                            UI_Evt::TrayShow => sm.reveal_from_tray(window, cx),
-                            UI_Evt::HideToTray => {
-                                sm.cancel_drag();
-                                sm.post_pending();
-                                sm.hide_to_tray(window);
+                        if WindowOps::dispatch(sm, &e, window, cx) == DispatchResult::Unhandled {
+                            if matches!(e, UI_Evt::SaveEditor) {
+                                sm.pull_editor_fields(cx);
                             }
-                            UI_Evt::TogglePin => {
-                                sm.toggle_pin();
-                                sm.apply_always_on_top(window);
-                            }
-                            UI_Evt::TrayQuit => sm.begin_close(),
-                            other => {
-                                if matches!(other, UI_Evt::SaveEditor) {
-                                    sm.pull_editor_fields(cx);
-                                }
-                                sm.dispatch_evt(&other);
-                            }
+                            sm.dispatch_evt(&e);
                         }
                     }
-                    if sm.close_failed() {
-                        sm.reveal_from_tray(window, cx);
-                    }
-                    if sm.ready_to_close() {
+                    if WindowOps::advance_exit(sm, window, cx) == ExitProgress::ExitReady {
                         SM_UI::uninstall_tray(window);
                         window.remove_window();
                         cx.quit();

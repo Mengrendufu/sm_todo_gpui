@@ -2,3 +2,4 @@
 
 pub mod thread;
 pub mod hsm;
+pub mod window_ops;
