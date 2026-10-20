@@ -2908,16 +2908,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kanban-core"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "serde",
- "thiserror 2.0.20",
- "uuid",
-]
-
-[[package]]
 name = "khronos-egl"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4452,6 +4442,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
+name = "rs_hsm_"
+version = "0.1.0"
+source = "git+https://github.com/Mengrendufu/rs_hsm_.git?rev=ef17bc5cbc2c4c9d54bde12c1534d3a2f03b114c#ef17bc5cbc2c4c9d54bde12c1534d3a2f03b114c"
+
+[[package]]
 name = "rs_sst"
 version = "0.1.0"
 source = "git+https://github.com/Mengrendufu/rs_sst.git?rev=005b8e03efd6e25e834f57f8d42333fc886672ee#005b8e03efd6e25e834f57f8d42333fc886672ee"
@@ -5017,9 +5012,13 @@ dependencies = [
  "async-channel 2.5.0",
  "chrono",
  "gpui",
- "kanban-core",
  "raw-window-handle",
+ "rs_hsm_",
  "rs_sst",
+ "rusqlite",
+ "serde",
+ "thiserror 2.0.20",
+ "uuid",
  "windows 0.61.3",
 ]
 

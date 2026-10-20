@@ -1,6 +1,4 @@
-//! UIThread: Inbox + RenderRuntime + SM_UI.
+//! UI thread package: thread runtime and the HSM that owns its controls.
 
-pub mod evt;
-pub mod inbox;
-pub mod render_runtime;
-pub mod sm_ui;
+pub mod thread;
+pub mod hsm;

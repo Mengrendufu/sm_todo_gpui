@@ -1,13 +1,13 @@
 //! Inbox: entity Component. Thread-external input door. Owns the UI_Evt queue.
-//! Does not interpret events. TimeEvt (cross-thread) and pointer/key (gpui)
-//! both enter as UI_Evt.
+//! Does not interpret events. Cross-thread signals and GUI coordination requests
+//! enter as owned UI_Evt values; local widget interactions do not enter here.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use async_channel::Sender;
 
-use crate::application::ui_thread::evt::UI_Evt;
+use crate::application::ui_thread::thread::evt::UI_Evt;
 
 pub struct UI_Inbox {
     q: VecDeque<UI_Evt>,

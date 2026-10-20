@@ -5,9 +5,13 @@ edition = "2021"
 
 [dependencies]
 rs_sst = { git = "https://github.com/Mengrendufu/rs_sst.git", rev = "005b8e03efd6e25e834f57f8d42333fc886672ee" }
+rs_hsm_ = { git = "https://github.com/Mengrendufu/rs_hsm_.git", rev = "ef17bc5cbc2c4c9d54bde12c1534d3a2f03b114c" }
 gpui = "0.2.2"
 async-channel = "2"
-kanban-core = { path = "../gui/sm_todo/src-tauri/kanban-core" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2.0.20"
+uuid = { version = "1.24.1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(windows)'.dependencies]

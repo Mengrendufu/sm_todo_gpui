@@ -1,7 +1,7 @@
 //! Passive board projections. No events, no authority.
 
 use gpui::{div, prelude::*, px, rgb, Rgba, WindowControlArea};
-use kanban_core::{Card, Priority};
+use crate::application::data::{Card, Priority};
 
 use super::{card_meta, theme::Theme};
 
@@ -150,9 +150,9 @@ pub fn scroll_y_from_thumb_top(
 
 pub fn traffic_light(
     id: &'static str,
-    area: WindowControlArea,
+    area: Option<WindowControlArea>,
     color: u32,
-) -> impl gpui::IntoElement {
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .w(px(22.))
@@ -161,7 +161,7 @@ pub fn traffic_light(
         .items_center()
         .justify_center()
         .cursor_pointer()
-        .window_control_area(area)
+        .when_some(area, |el, area| el.window_control_area(area))
         .child(
             div()
                 .size(px(12.))

@@ -13,7 +13,7 @@ use super::edge_dock::{
     TRAY_REVEAL_HOLD_MS, DockAction, DockIntent, DockMode, DockSession, Rect, Size, TrayRevealPlan,
 };
 use super::window_chrome::{self, SlideFrame};
-use super::SM_UI;
+use super::{SM_UI, UI_Controls};
 
 pub struct TopEdgeDock {
     session: DockSession,
@@ -28,6 +28,7 @@ pub struct TopEdgeDock {
     slide_frame: Option<SlideFrame>,
     last_hold_open: bool,
     wired: bool,
+    hidden_to_tray: bool,
 }
 
 impl TopEdgeDock {
@@ -45,16 +46,32 @@ impl TopEdgeDock {
             slide_frame: None,
             last_hold_open: false,
             wired: false,
+            hidden_to_tray: false,
         }
+    }
+
+    fn suspend_for_tray(&mut self) {
+        self.hidden_to_tray = true;
+        self.settle_gen = self.settle_gen.wrapping_add(1);
+        self.collapse_gen = self.collapse_gen.wrapping_add(1);
+        self.poll_gen = self.poll_gen.wrapping_add(1);
+        self.slide_gen = self.slide_gen.wrapping_add(1);
+        self.apply_gen = self.apply_gen.wrapping_add(1);
+        self.applying = false;
     }
 }
 
-impl SM_UI {
+impl UI_Controls {
+    pub(crate) fn hide_to_tray(&mut self, window: &Window) {
+        self.top_dock.suspend_for_tray();
+        window_chrome::hide(window);
+    }
+
     pub(super) fn dock_hold_open(&self) -> bool {
         self.editor.is_some() || self.dragging.is_some()
     }
 
-    pub(super) fn wire_top_edge_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn wire_top_edge_dock(&mut self, window: &mut Window, cx: &mut Context<SM_UI>) {
         if self.top_dock.wired {
             return;
         }
@@ -65,14 +82,20 @@ impl SM_UI {
         .detach();
     }
 
-    pub(super) fn sync_window_hover(&mut self, window: &Window, cx: &mut Context<Self>) {
+    pub(super) fn sync_window_hover(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
+        if self.top_dock.hidden_to_tray {
+            return;
+        }
         let hovered = window.is_window_hovered();
         if hovered != self.top_dock.pointer_inside {
             self.note_window_hover(hovered, window, cx);
         }
     }
 
-    pub(super) fn sync_dock_hold_open(&mut self, window: &Window, cx: &mut Context<Self>) {
+    pub(super) fn sync_dock_hold_open(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
+        if self.top_dock.hidden_to_tray {
+            return;
+        }
         let hold_open = self.dock_hold_open();
         let was = self.top_dock.last_hold_open;
         self.top_dock.last_hold_open = hold_open;
@@ -92,8 +115,17 @@ impl SM_UI {
         }
     }
 
-    pub(crate) fn reveal_from_tray(&mut self, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn reveal_from_tray(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
+        let was_hidden = self.top_dock.hidden_to_tray;
+        self.top_dock.hidden_to_tray = false;
         self.top_dock.collapse_gen = self.top_dock.collapse_gen.wrapping_add(1);
+        // A hide can interrupt the slide that was revealing a docked window.
+        if was_hidden && self.top_dock.session.mode == DockMode::Expanded {
+            if let Some(work) = window_chrome::work_area(window, cx) {
+                let box_ = self.reveal_box(work);
+                window_chrome::set_position(window, box_.x, box_.y);
+            }
+        }
         if tray_reveal_plan(self.top_dock.session.mode) == TrayRevealPlan::ExpandDock {
             if window_chrome::work_area(window, cx).is_none()
                 || self.top_dock.session.remembered.is_none()
@@ -113,7 +145,7 @@ impl SM_UI {
         window.activate_window();
     }
 
-    fn arm_collapse_if_cursor_left(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn arm_collapse_if_cursor_left(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
         let box_ = window_chrome::window_rect(window);
         let over = window_chrome::cursor_point(window)
             .is_some_and(|cursor| is_point_in_rect(cursor, box_));
@@ -123,7 +155,10 @@ impl SM_UI {
         }
     }
 
-    fn note_window_moved(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn note_window_moved(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
+        if self.top_dock.hidden_to_tray {
+            return;
+        }
         self.top_dock.last_moved_at = Instant::now();
         if should_skip_settle(self.top_dock.applying, self.top_dock.session.mode) {
             return;
@@ -131,7 +166,7 @@ impl SM_UI {
         self.schedule_settle(window, cx);
     }
 
-    fn note_window_hover(&mut self, inside: bool, window: &Window, cx: &mut Context<Self>) {
+    fn note_window_hover(&mut self, inside: bool, window: &Window, cx: &mut Context<SM_UI>) {
         self.top_dock.pointer_inside = inside;
         if inside {
             self.top_dock.collapse_gen = self.top_dock.collapse_gen.wrapping_add(1);
@@ -147,7 +182,7 @@ impl SM_UI {
         self.schedule_collapse(window, cx, COLLAPSE_DELAY_MS);
     }
 
-    fn schedule_settle(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn schedule_settle(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
         self.top_dock.settle_gen = self.top_dock.settle_gen.wrapping_add(1);
         let gen = self.top_dock.settle_gen;
         cx.spawn_in(window, async move |this, cx| {
@@ -163,7 +198,7 @@ impl SM_UI {
         .detach();
     }
 
-    fn schedule_collapse(&mut self, window: &Window, cx: &mut Context<Self>, delay_ms: u64) {
+    fn schedule_collapse(&mut self, window: &Window, cx: &mut Context<SM_UI>, delay_ms: u64) {
         self.top_dock.collapse_gen = self.top_dock.collapse_gen.wrapping_add(1);
         let gen = self.top_dock.collapse_gen;
         cx.spawn_in(window, async move |this, cx| {
@@ -179,7 +214,7 @@ impl SM_UI {
         .detach();
     }
 
-    fn mark_applying(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn mark_applying(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
         self.top_dock.applying = true;
         self.top_dock.apply_gen = self.top_dock.apply_gen.wrapping_add(1);
         let gen = self.top_dock.apply_gen;
@@ -195,8 +230,10 @@ impl SM_UI {
         .detach();
     }
 
-    fn run_settle(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if should_skip_settle(self.top_dock.applying, self.top_dock.session.mode) {
+    fn run_settle(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
+        if self.top_dock.hidden_to_tray
+            || should_skip_settle(self.top_dock.applying, self.top_dock.session.mode)
+        {
             return;
         }
         let Some(work) = window_chrome::work_area(window, cx) else {
@@ -217,8 +254,8 @@ impl SM_UI {
         self.apply_now(intent, window, cx);
     }
 
-    fn run_collapse(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.dock_hold_open() || self.top_dock.pointer_inside {
+    fn run_collapse(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
+        if self.top_dock.hidden_to_tray || self.dock_hold_open() || self.top_dock.pointer_inside {
             return;
         }
         let elapsed_ms = self.top_dock.last_moved_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -240,7 +277,7 @@ impl SM_UI {
         self.apply_now(intent, window, cx);
     }
 
-    fn expand_now(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn expand_now(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
         let Some(work) = window_chrome::work_area(window, cx) else {
             return;
         };
@@ -267,7 +304,10 @@ impl SM_UI {
         }
     }
 
-    fn apply_now(&mut self, intent: DockIntent, window: &Window, cx: &mut Context<Self>) {
+    fn apply_now(&mut self, intent: DockIntent, window: &Window, cx: &mut Context<SM_UI>) {
+        if self.top_dock.hidden_to_tray {
+            return;
+        }
         let action = apply_intent(&mut self.top_dock.session, intent);
         if action == DockAction::None {
             return;
@@ -294,7 +334,7 @@ impl SM_UI {
         self.top_dock.poll_gen = self.top_dock.poll_gen.wrapping_add(1);
     }
 
-    fn start_hot_edge_poll(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn start_hot_edge_poll(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
         self.top_dock.poll_gen = self.top_dock.poll_gen.wrapping_add(1);
         let gen = self.top_dock.poll_gen;
         cx.spawn_in(window, async move |this, cx| {
@@ -319,7 +359,10 @@ impl SM_UI {
         .detach();
     }
 
-    fn poll_hot_edge_once(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn poll_hot_edge_once(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
+        if self.top_dock.hidden_to_tray {
+            return;
+        }
         let Some(work) = window_chrome::work_area(window, cx) else {
             return;
         };
@@ -339,13 +382,16 @@ impl SM_UI {
         self.expand_now(window, cx);
     }
 
-    fn start_slide(&mut self, window: &Window, cx: &mut Context<Self>, hide: bool) {
+    fn start_slide(&mut self, window: &Window, cx: &mut Context<SM_UI>, hide: bool) {
         self.top_dock.slide_gen = self.top_dock.slide_gen.wrapping_add(1);
         let gen = self.top_dock.slide_gen;
         cx.spawn_in(window, async move |this, cx| {
             if hide {
                 let Some(frame) = this
                     .update_in(cx, |this, window, _cx| {
+                        if this.top_dock.slide_gen != gen {
+                            return None;
+                        }
                         let frame = window_chrome::begin_slide_hide(window)?;
                         this.top_dock.slide_frame = Some(frame);
                         Some(frame)
@@ -354,6 +400,9 @@ impl SM_UI {
                     .flatten()
                 else {
                     this.update_in(cx, |this, window, cx| {
+                        if this.top_dock.slide_gen != gen {
+                            return;
+                        }
                         window_chrome::hide(window);
                         this.start_hot_edge_poll(window, cx);
                     })
@@ -374,6 +423,9 @@ impl SM_UI {
 
             let Some(frame) = this
                 .update_in(cx, |this, window, _cx| {
+                    if this.top_dock.slide_gen != gen {
+                        return None;
+                    }
                     let frame = this.top_dock.slide_frame?;
                     if !window_chrome::begin_slide_show(window, &frame) {
                         window_chrome::show(window);

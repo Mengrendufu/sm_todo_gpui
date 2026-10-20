@@ -1,5 +1,4 @@
-//! SM_UI subsystem: HSM on UIThread. Not an AO.
-//! Display components hang here.
+//! GUI-thread HSM owner and its controls. Local feedback stays in GPUI callbacks.
 
 pub mod calendar;
 pub mod card_editor;
@@ -8,6 +7,7 @@ pub mod text_field;
 pub mod theme;
 pub mod widgets;
 pub mod window_pin;
+mod state_machine;
 mod edge_dock;
 mod window_chrome;
 mod window_taskbar;
@@ -15,7 +15,10 @@ mod top_edge_dock;
 mod tray_icon;
 
 use crate::application::data::DataManager;
-use crate::application::ui_thread::evt::UI_Evt;
+use crate::application::ui_thread::thread::evt::UI_Evt;
+use crate::application::ui_thread::thread::inbox::UI_Inbox_post;
+use rs_hsm_::{SM_Hsm, SM_HsmTrait};
+use std::ops::{Deref, DerefMut};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -26,7 +29,7 @@ use gpui::{
 };
 #[cfg(test)]
 use gpui::{Pixels, Point};
-use kanban_core::{Card, Priority, Status};
+use crate::application::data::{Card, Priority, Status};
 
 const HOLE_ANIM_MS: u64 = 280;
 const SETTLE_ANIM_MS: u64 = 140;
@@ -419,6 +422,7 @@ struct DragSession {
     before_id: Option<String>,
     body: f32,
     pitch: f32,
+    width: f32,
 }
 
 struct DropSettle {
@@ -432,6 +436,20 @@ struct DropSettle {
     epoch: u64,
     started: Instant,
     shown: bool,
+}
+
+impl DropSettle {
+    fn progress(&mut self, now: Instant) -> f32 {
+        if !self.shown {
+            self.shown = true;
+            self.started = now;
+            return 0.0;
+        }
+        let t = (now.duration_since(self.started).as_secs_f32()
+            / Duration::from_millis(SETTLE_ANIM_MS).as_secs_f32())
+            .min(1.0);
+        1.0 - (1.0 - t).powi(3)
+    }
 }
 
 struct ScrollbarDrag {
@@ -455,6 +473,74 @@ struct Editor {
 }
 
 pub struct SM_UI {
+    hsm: SM_Hsm<UI_Controls>,
+    controls: UI_Controls,
+}
+
+// GPUI listeners borrow this owner. Deref keeps local widget operations on its
+// controls; coordination requests enter dispatch_evt through the thread Inbox.
+impl Deref for SM_UI {
+    type Target = UI_Controls;
+
+    fn deref(&self) -> &Self::Target {
+        &self.controls
+    }
+}
+
+impl DerefMut for SM_UI {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.controls
+    }
+}
+
+impl SM_UI {
+    pub fn setup(_host: SM_UI_HostOps, data: DataManager) -> Self {
+        let mut me = Self {
+            hsm: SM_Hsm::new(),
+            controls: UI_Controls::new(data),
+        };
+        UI_Controls::init(&mut me.hsm, &mut me.controls);
+        me
+    }
+
+    pub fn dispatch_evt(&mut self, e: &UI_Evt) {
+        UI_Controls::dispatch(&mut self.hsm, &mut self.controls, e);
+    }
+
+    pub fn uninstall_tray(window: &Window) {
+        tray_icon::uninstall(window);
+    }
+
+    #[cfg(test)]
+    fn open_create(&mut self) {
+        self.dispatch_evt(&UI_Evt::NewCard);
+    }
+
+    #[cfg(test)]
+    fn open_edit(&mut self, id: &str) {
+        self.dispatch_evt(&UI_Evt::EditCard { id: id.into() });
+    }
+
+    #[cfg(test)]
+    fn close_editor(&mut self) {
+        self.dispatch_evt(&UI_Evt::CancelEditor);
+    }
+
+    #[cfg(test)]
+    fn save_editor(&mut self) -> bool {
+        self.dispatch_evt(&UI_Evt::SaveEditor);
+        self.editor.is_none()
+    }
+
+    #[cfg(test)]
+    fn delete_editor(&mut self) -> bool {
+        self.dispatch_evt(&UI_Evt::DeleteEditor);
+        self.editor.is_none()
+    }
+}
+
+/// Controls owned by SM_UI's HSM context; all GPUI access stays on the GUI thread.
+pub struct UI_Controls {
     data: DataManager,
     cards: Vec<Card>,
     pinned: bool,
@@ -487,8 +573,8 @@ pub struct SM_UI {
     top_dock: top_edge_dock::TopEdgeDock,
 }
 
-impl SM_UI {
-    pub fn setup(_host: SM_UI_HostOps, data: DataManager) -> Self {
+impl UI_Controls {
+    fn new(data: DataManager) -> Self {
         let mut me = Self {
             data,
             cards: Vec::new(),
@@ -546,16 +632,6 @@ impl SM_UI {
         window_taskbar::set_skip_taskbar(window);
     }
 
-    pub fn uninstall_tray(window: &Window) {
-        tray_icon::uninstall(window);
-    }
-
-    pub fn dispatch_evt(&mut self, e: &UI_Evt) {
-        match e {
-            UI_Evt::Timeout | UI_Evt::Null | UI_Evt::TrayShow | UI_Evt::TrayQuit => {}
-        }
-    }
-
     pub fn add_todo_card(&mut self, title: &str) {
         if self.data.createCard(title).is_ok() {
             self.reload();
@@ -576,7 +652,7 @@ impl SM_UI {
             .and_then(|editor| editor.error.as_deref())
     }
 
-    pub fn open_create(&mut self) {
+    fn open_create(&mut self) {
         let _ = card_editor::command_on_create_click();
         self.editor = Some(Editor {
             kind: card_editor::EditorKind::Create,
@@ -593,7 +669,7 @@ impl SM_UI {
         self.calendar_open = false;
     }
 
-    pub fn open_edit(&mut self, id: &str) {
+    fn open_edit(&mut self, id: &str) {
         let Some(card) = self.cards.iter().find(|card| card.id == id).cloned() else {
             return;
         };
@@ -613,7 +689,7 @@ impl SM_UI {
         self.calendar_open = false;
     }
 
-    pub fn close_editor(&mut self) {
+    fn close_editor(&mut self) {
         let _ = card_editor::command_on_editor_cancel();
         self.editor = None;
         self.calendar_open = false;
@@ -660,7 +736,7 @@ impl SM_UI {
         })
     }
 
-    pub fn save_editor(&mut self) -> bool {
+    fn save_editor(&mut self) -> bool {
         let Some(editor) = self.editor.as_ref() else {
             return false;
         };
@@ -699,7 +775,7 @@ impl SM_UI {
         }
     }
 
-    pub fn delete_editor(&mut self) -> bool {
+    fn delete_editor(&mut self) -> bool {
         let Some(editor) = self.editor.as_ref() else {
             return false;
         };
@@ -716,7 +792,7 @@ impl SM_UI {
         }
     }
 
-    fn ensure_editor_fields(&mut self, cx: &mut Context<Self>, window: &mut Window) {
+    fn ensure_editor_fields(&mut self, cx: &mut Context<SM_UI>, window: &mut Window) {
         if self.title_field.is_none() {
             self.title_field = Some(cx.new(|cx| text_field::TextField::new(cx, "", 22.0, false)));
             self.notes_field = Some(cx.new(|cx| text_field::TextField::new(cx, "", 96.0, true)));
@@ -740,7 +816,11 @@ impl SM_UI {
         }
     }
 
-    fn pull_editor_fields(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn pull_editor_fields(&mut self, cx: &mut Context<SM_UI>) {
+        // A queued open followed by save can be drained before the first render.
+        if self.fields_dirty {
+            return;
+        }
         let Some(editor) = &mut self.editor else {
             return;
         };
@@ -836,6 +916,7 @@ impl SM_UI {
         let inner = self.card_inner_width(status);
         let body = widgets::card_body_height(&card.title, &card.notes, inner);
         let pitch = body + widgets::SLOT_GAP;
+        let width = self.ghost_size_for(status).0;
         let before_id = self
             .cards
             .iter()
@@ -849,6 +930,7 @@ impl SM_UI {
             before_id: before_id.clone(),
             body,
             pitch,
+            width,
         });
         self.holes.clear();
         self.slides.clear();
@@ -1028,13 +1110,11 @@ impl SM_UI {
         let pointer_y = self.pointer_y?;
         let (origin_x, origin_y, scroll_y) = self.list_frame(to_status)?;
         let ids = self.dest_ids(to_status);
-        let index = self
-            .last_insert_index
-            .unwrap_or_else(|| insert_index(&ids, before_id));
+        let index = insert_index(&ids, before_id);
         let (from_x, from_y) = ghost_origin(pointer_x, pointer_y, self.grab_x, self.grab_y);
         let to_x = slot_origin_x(origin_x);
         let to_y = slot_origin_y(origin_y, scroll_y, index, &self.dest_pitches(to_status));
-        if (from_x - to_x).abs() < 1.0 && (from_y - to_y).abs() < 1.0 {
+        if from_x == to_x && from_y == to_y {
             return None;
         }
         let card = self
@@ -1042,7 +1122,11 @@ impl SM_UI {
             .iter()
             .find(|card| card.id == id)
             .cloned()?;
-        let (width, _) = self.ghost_size_for(to_status);
+        let width = self
+            .dragging
+            .as_ref()
+            .map(|drag| drag.width)
+            .unwrap_or_else(|| self.ghost_size_for(to_status).0);
         self.hole_epoch += 1;
         Some(DropSettle {
             id: id.to_string(),
@@ -1181,22 +1265,19 @@ impl SM_UI {
         self.pending_persist.is_some()
     }
 
-    fn flush_pending_persist(&mut self) {
-        let Some((id, to_status, before_id)) = self.pending_persist.take() else {
-            return;
-        };
-        if self
-            .data
-            .persist_move(&id, to_status, before_id.as_deref())
-            .is_err()
-        {
-            self.reload();
-        }
+    pub(super) fn take_pending_move(&mut self) -> Option<UI_Evt> {
+        self.pending_persist.take().map(|(id, to_status, before_id)| {
+            UI_Evt::PersistMove { id, to_status, before_id }
+        })
     }
 
     pub fn commit_drop(&mut self) {
-        if let Some(drag) = self.dragging.take() {
-            self.drop_card(&drag.id, drag.to_status, drag.before_id.as_deref());
+        if let Some((id, status, before)) = self
+            .dragging
+            .as_ref()
+            .map(|drag| (drag.id.clone(), drag.to_status, drag.before_id.clone()))
+        {
+            self.drop_card(&id, status, before.as_deref());
         }
     }
 
@@ -1330,7 +1411,7 @@ impl SM_UI {
         self.cards = self.data.getCards().unwrap_or_default();
     }
 
-    pub fn flush(&mut self) {
+    pub fn flush(&mut self) -> Option<UI_Evt> {
         self.snapshot_column_frames();
         let hole_limit = Duration::from_millis(HOLE_ANIM_MS);
         self.holes
@@ -1339,14 +1420,8 @@ impl SM_UI {
             .retain(|slide| slide.started.elapsed() < hole_limit);
         let settle_limit = Duration::from_millis(SETTLE_ANIM_MS);
         match self.settling.as_ref().map(|settle| settle.shown) {
-            Some(false) => {
-                if let Some(settle) = &mut self.settling {
-                    settle.shown = true;
-                    settle.started = Instant::now();
-                }
-            }
+            Some(false) => None,
             Some(true) => {
-                self.flush_pending_persist();
                 if self
                     .settling
                     .as_ref()
@@ -1354,8 +1429,9 @@ impl SM_UI {
                 {
                     self.settling = None;
                 }
+                self.take_pending_move()
             }
-            None => self.flush_pending_persist(),
+            None => self.take_pending_move(),
         }
     }
 
@@ -1372,7 +1448,7 @@ impl SM_UI {
         }
     }
 
-    fn titlebar(&self, window: &Window, theme: theme::Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn titlebar(&self, window: &Window, theme: theme::Theme, cx: &mut Context<SM_UI>) -> impl IntoElement {
         let active = window.is_window_active();
         let close = if active { 0xff5f57 } else { theme.traffic_dim };
         let min = if active { 0xfebc2e } else { theme.traffic_dim };
@@ -1397,9 +1473,14 @@ impl SM_UI {
                     .items_center()
                     .gap_2()
                     .pr_2()
-                    .child(widgets::traffic_light("close", WindowControlArea::Close, close))
-                    .child(widgets::traffic_light("min", WindowControlArea::Min, min))
-                    .child(widgets::traffic_light("max", WindowControlArea::Max, max)),
+                    .child(widgets::traffic_light("close", Some(WindowControlArea::Close), close))
+                    .child(widgets::traffic_light("min", None, min).on_click(cx.listener(
+                        |_, _, _, cx| {
+                            UI_Inbox_post(UI_Evt::HideToTray);
+                            cx.notify();
+                        },
+                    )))
+                    .child(widgets::traffic_light("max", Some(WindowControlArea::Max), max)),
             )
             .child(widgets::titlebar_drag("titlebar-drag"))
             .child(
@@ -1416,9 +1497,8 @@ impl SM_UI {
                     .text_color(pin_fg)
                     .text_xs()
                     .hover(move |this| this.bg(pin_hover))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_pin();
-                        this.apply_always_on_top(window);
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        UI_Inbox_post(UI_Evt::TogglePin);
                         cx.notify();
                     }))
                     .child(if self.pinned { "●" } else { "○" }),
@@ -1446,7 +1526,7 @@ impl SM_UI {
         &self,
         status: Status,
         theme: theme::Theme,
-        cx: &mut Context<Self>,
+        cx: &mut Context<SM_UI>,
     ) -> impl IntoElement {
         let scroll = &self.column_scroll[status_key(status) as usize];
         let viewport = f32::from(scroll.bounds().size.height);
@@ -1510,7 +1590,7 @@ impl SM_UI {
         title: &'static str,
         status: Status,
         theme: theme::Theme,
-        cx: &mut Context<Self>,
+        cx: &mut Context<SM_UI>,
     ) -> impl IntoElement {
         let count = self.cards_in(status).len();
         let mut kids = Vec::new();
@@ -1587,7 +1667,9 @@ impl SM_UI {
                 let gold_soft = theme.gold_soft();
                 move |style, _, _, _| style.bg(gold_soft)
             })
-            .on_drop(cx.listener(move |this, info: &DragCard, _, cx| {
+            .on_drop(cx.listener(move |this, info: &DragCard, window, cx| {
+                let pointer = window.mouse_position();
+                this.note_pointer(f32::from(pointer.x), f32::from(pointer.y));
                 let hovered_here = this
                     .dragging
                     .as_ref()
@@ -1606,7 +1688,7 @@ impl SM_UI {
         card: &Card,
         status: Status,
         theme: theme::Theme,
-        cx: &mut Context<Self>,
+        cx: &mut Context<SM_UI>,
     ) -> impl IntoElement {
         let id = card.id.clone();
         let payload = DragCard {
@@ -1643,6 +1725,7 @@ impl SM_UI {
                                 f32::from(window.mouse_position().x),
                                 f32::from(window.mouse_position().y),
                             );
+                            let this = &mut this.controls;
                             this.note_column_frame(
                                 status,
                                 f32::from(
@@ -1673,7 +1756,9 @@ impl SM_UI {
                     })
                 }
             })
-            .on_drop(cx.listener(move |this, _: &DragCard, _, cx| {
+            .on_drop(cx.listener(move |this, _: &DragCard, window, cx| {
+                let pointer = window.mouse_position();
+                this.note_pointer(f32::from(pointer.x), f32::from(pointer.y));
                 this.commit_drop();
                 cx.notify();
             }))
@@ -1683,7 +1768,7 @@ impl SM_UI {
                     if this.dragging.is_some() {
                         return;
                     }
-                    this.open_edit(&id);
+                    UI_Inbox_post(UI_Evt::EditCard { id: id.clone() });
                     cx.notify();
                 }
             }))
@@ -1695,7 +1780,7 @@ impl SM_UI {
         epoch: u64,
         phase: HolePhase,
         theme: theme::Theme,
-        cx: &mut Context<Self>,
+        cx: &mut Context<SM_UI>,
     ) -> impl IntoElement {
         let id = hole_elem_id(phase, epoch);
         let pitch = self.drag_pitch();
@@ -1711,7 +1796,9 @@ impl SM_UI {
                     .h(px(spec.height))
                     .min_h(px(spec.min_height))
                     .max_h(px(spec.max_height))
-                    .on_drop(cx.listener(move |this, _: &DragCard, _, cx| {
+                    .on_drop(cx.listener(move |this, _: &DragCard, window, cx| {
+                        let pointer = window.mouse_position();
+                        this.note_pointer(f32::from(pointer.x), f32::from(pointer.y));
                         this.commit_drop();
                         cx.notify();
                     }))
@@ -1724,7 +1811,9 @@ impl SM_UI {
                 .flex_none()
                 .overflow_hidden()
                 .min_h_0()
-                .on_drop(cx.listener(move |this, _: &DragCard, _, cx| {
+                .on_drop(cx.listener(move |this, _: &DragCard, window, cx| {
+                    let pointer = window.mouse_position();
+                    this.note_pointer(f32::from(pointer.x), f32::from(pointer.y));
                     this.commit_drop();
                     cx.notify();
                 }))
@@ -1744,13 +1833,15 @@ impl SM_UI {
         slot
     }
 
-    fn append_slot(&self, status: Status, cx: &mut Context<Self>) -> impl IntoElement {
+    fn append_slot(&self, status: Status, cx: &mut Context<SM_UI>) -> impl IntoElement {
         div()
             .id(("append", status_key(status)))
             .flex_1()
             .w_full()
             .min_h(px(32.))
-            .on_drop(cx.listener(move |this, info: &DragCard, _, cx| {
+            .on_drop(cx.listener(move |this, info: &DragCard, window, cx| {
+                let pointer = window.mouse_position();
+                this.note_pointer(f32::from(pointer.x), f32::from(pointer.y));
                 this.drop_card(&info.card.id, status, None);
                 cx.notify();
             }))
@@ -1813,42 +1904,46 @@ impl SM_UI {
             .collect()
     }
 
-    fn settle_overlay(&self, theme: theme::Theme) -> impl IntoElement {
-        let Some(settle) = &self.settling else {
+    fn settle_overlay(&mut self, window: &mut Window, theme: theme::Theme) -> impl IntoElement {
+        let Some(settle) = &mut self.settling else {
             return div().into_any_element();
         };
-        let from_x = settle.from_x;
-        let from_y = settle.from_y;
-        let to_x = settle.to_x;
-        let to_y = settle.to_y;
+        let delta = settle.progress(Instant::now());
+        let origin = point(
+            px(settle.from_x + (settle.to_x - settle.from_x) * delta),
+            px(settle.from_y + (settle.to_y - settle.from_y) * delta),
+        );
+        let card = settle.card.clone();
+        let width = settle.width;
         let id = ("drop-settle", settle.epoch);
-        div()
-            .id(id)
-            .absolute()
-            .left(px(from_x))
-            .top(px(from_y))
-            .w(px(settle.width))
-            .h(px(widgets::card_body_height(
-                &settle.card.title,
-                &settle.card.notes,
-                (settle.width - widgets::COLUMN_PAD_X * 2.0).max(0.0),
-            )))
-            .overflow_hidden()
-            .opacity(0.7)
-            .child(widgets::CardTile(&settle.card, theme))
-            .with_animation(
-                id,
-                Animation::new(Duration::from_millis(SETTLE_ANIM_MS)).with_easing(ease_in_out),
-                move |el, delta| {
-                    el.left(px(from_x + (to_x - from_x) * delta))
-                        .top(px(from_y + (to_y - from_y) * delta))
-                        .opacity(0.7 + 0.3 * delta)
-                },
-            )
-            .into_any_element()
+        window.request_animation_frame();
+        // Match GPUI's drag preview: apply the window-space origin after layout,
+        // preserving fractional pixels instead of rounding absolute left/top.
+        gpui::canvas(
+            move |_, window, cx| {
+                let mut element = div()
+                    .id(id)
+                    .w(px(width))
+                    .h(px(widgets::card_body_height(
+                        &card.title,
+                        &card.notes,
+                        (width - widgets::COLUMN_PAD_X * 2.0).max(0.0),
+                    )))
+                    .overflow_hidden()
+                    .opacity(0.7 + 0.3 * delta)
+                    .child(widgets::CardTile(&card, theme))
+                    .into_any_element();
+                element.prepaint_as_root(origin, gpui::AvailableSpace::min_size(), window, cx);
+                element
+            },
+            |_, mut element, window, cx| element.paint(window, cx),
+        )
+        .absolute()
+        .size_full()
+        .into_any_element()
     }
 
-    fn editor_overlay(&self, theme: theme::Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn editor_overlay(&self, theme: theme::Theme, cx: &mut Context<SM_UI>) -> impl IntoElement {
         let Some(editor) = &self.editor else {
             return div().into_any_element();
         };
@@ -1953,8 +2048,8 @@ impl SM_UI {
             .justify_center()
             .bg(theme.backdrop())
             .occlude()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.close_editor();
+            .on_click(cx.listener(|_, _, _, cx| {
+                UI_Inbox_post(UI_Evt::CancelEditor);
                 cx.notify();
             }))
             .child(form)
@@ -2276,8 +2371,8 @@ fn editor_actions(
                 .text_xs()
                 .text_color(theme.danger())
                 .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.delete_editor();
+                .on_click(cx.listener(|_, _, _, cx| {
+                    UI_Inbox_post(UI_Evt::DeleteEditor);
                     cx.notify();
                 }))
                 .child("删除"),
@@ -2295,8 +2390,8 @@ fn editor_actions(
             .border_color(theme.line_strong())
             .text_xs()
             .cursor_pointer()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.close_editor();
+            .on_click(cx.listener(|_, _, _, cx| {
+                UI_Inbox_post(UI_Evt::CancelEditor);
                 cx.notify();
             }))
             .child("取消"),
@@ -2311,9 +2406,8 @@ fn editor_actions(
             .text_color(theme.on_primary())
             .text_xs()
             .cursor_pointer()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.pull_editor_fields(cx);
-                this.save_editor();
+            .on_click(cx.listener(|_, _, _, cx| {
+                UI_Inbox_post(UI_Evt::SaveEditor);
                 cx.notify();
             }))
             .child("保存"),
@@ -2322,7 +2416,16 @@ fn editor_actions(
 
 impl Render for SM_UI {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.flush();
+        self.controls.render_controls(window, cx)
+    }
+}
+
+impl UI_Controls {
+    fn render_controls(&mut self, window: &mut Window, cx: &mut Context<SM_UI>) -> impl IntoElement {
+        // Preserve the first landing frame before scheduling persistence.
+        if let Some(e) = self.flush() {
+            UI_Inbox_post(e);
+        }
         self.wire_top_edge_dock(window, cx);
         self.sync_window_hover(window, cx);
         self.sync_dock_hold_open(window, cx);
@@ -2340,14 +2443,13 @@ impl Render for SM_UI {
             .text_color(theme.ink())
             .on_action(cx.listener(|this, _: &SaveEditor, _, cx| {
                 if this.editor.is_some() {
-                    this.pull_editor_fields(cx);
-                    this.save_editor();
+                    UI_Inbox_post(UI_Evt::SaveEditor);
                     cx.notify();
                 }
             }))
             .on_action(cx.listener(|this, _: &CloseEditor, _, cx| {
                 if this.editor.is_some() {
-                    this.close_editor();
+                    UI_Inbox_post(UI_Evt::CancelEditor);
                     cx.notify();
                 }
             }))
@@ -2393,8 +2495,8 @@ impl Render for SM_UI {
                             .bg(theme.gold())
                             .cursor_pointer()
                             .hover(|this| this.bg(theme.gold_hover()))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.open_create();
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                UI_Inbox_post(UI_Evt::NewCard);
                                 cx.notify();
                             }))
                             .child(
@@ -2430,7 +2532,7 @@ impl Render for SM_UI {
                     .child(self.render_column("进行中", Status::Doing, theme, cx))
                     .child(self.render_column("完成", Status::Done, theme, cx)),
             )
-            .child(self.settle_overlay(theme))
+            .child(self.settle_overlay(window, theme))
             .child(self.editor_overlay(theme, cx))
     }
 }
@@ -2438,6 +2540,12 @@ impl Render for SM_UI {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn flush(sm: &mut SM_UI) {
+        if let Some(e) = sm.controls.flush() {
+            sm.dispatch_evt(&e);
+        }
+    }
 
     fn host() -> SM_UI_HostOps {
         SM_UI_HostOps {
@@ -2631,9 +2739,10 @@ mod tests {
         sm.commit_drop();
         assert_eq!(titles(&sm, Status::Doing), vec!["A"]);
         assert!(sm.persist_pending());
-        sm.flush();
+        flush(&mut sm);
         assert!(sm.persist_pending());
-        sm.flush();
+        sm.settling.as_mut().unwrap().progress(Instant::now());
+        flush(&mut sm);
         assert!(!sm.persist_pending());
         assert_eq!(titles(&sm, Status::Doing), vec!["A"]);
     }
@@ -3049,7 +3158,8 @@ mod tests {
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
-        sm.start_drag(&ids(&sm, Status::Todo)[0]);
+        let id = ids(&sm, Status::Todo)[0].clone();
+        sm.start_drag(&id);
         sm.set_grab_offset(0.0, 0.0);
         let y = widgets::SLOT_PITCH - widgets::SLOT_BODY + 1.0;
         sm.hover_pointer(Status::Todo, y);
@@ -3062,7 +3172,8 @@ mod tests {
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
-        sm.start_drag(&ids(&sm, Status::Todo)[0]);
+        let id = ids(&sm, Status::Todo)[0].clone();
+        sm.start_drag(&id);
         sm.set_grab_offset(0.0, 0.0);
         assert!(sm.hover_pointer(
             Status::Todo,
@@ -3143,7 +3254,8 @@ mod tests {
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
-        sm.start_drag(&ids(&sm, Status::Todo)[0]);
+        let id = ids(&sm, Status::Todo)[0].clone();
+        sm.start_drag(&id);
         sm.set_grab_offset(0.0, 0.0);
         assert!(sm.hover_pointer(
             Status::Todo,
@@ -3163,7 +3275,8 @@ mod tests {
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
-        sm.start_drag(&ids(&sm, Status::Todo)[2]);
+        let id = ids(&sm, Status::Todo)[2].clone();
+        sm.start_drag(&id);
         assert!(sm.hover_pointer(Status::Todo, insert_boundary(0) + 1.0));
         assert_eq!(column_marks(&sm, Status::Todo), vec!["A", "□", "B"]);
     }
@@ -3174,7 +3287,8 @@ mod tests {
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
-        sm.start_drag(&ids(&sm, Status::Todo)[2]);
+        let id = ids(&sm, Status::Todo)[2].clone();
+        sm.start_drag(&id);
         assert!(sm.hover_pointer(Status::Todo, 0.0));
         assert_eq!(column_marks(&sm, Status::Todo), vec!["□", "A", "B"]);
     }
@@ -3185,7 +3299,8 @@ mod tests {
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
-        sm.start_drag(&ids(&sm, Status::Todo)[0]);
+        let id = ids(&sm, Status::Todo)[0].clone();
+        sm.start_drag(&id);
         sm.set_grab_offset(0.0, 0.0);
         let y = squeeze_down_y(widgets::SLOT_PITCH);
         assert!(sm.hover_pointer(Status::Todo, y));
@@ -3200,7 +3315,8 @@ mod tests {
         sm.add_todo_card("A");
         sm.add_todo_card("B");
         sm.add_todo_card("C");
-        sm.start_drag(&ids(&sm, Status::Todo)[0]);
+        let id = ids(&sm, Status::Todo)[0].clone();
+        sm.start_drag(&id);
         sm.set_grab_offset(0.0, 0.0);
         assert!(sm.hover_pointer(
             Status::Todo,
@@ -3249,9 +3365,75 @@ mod tests {
         let settle = sm.settling_delta().unwrap();
         assert!(settle.0.abs() > 1.0 || settle.1.abs() > 1.0);
         sm.expire_settle();
-        sm.flush();
+        flush(&mut sm);
         assert_eq!(sm.settling_id(), None);
         assert!(!sm.card_is_hidden(&a));
+    }
+
+    #[test]
+    fn drop_starts_at_fractional_preview_origin_and_moves_on_the_next_frame() {
+        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        sm.add_todo_card("A");
+        let a = ids(&sm, Status::Todo)[0].clone();
+        sm.start_drag(&a);
+        sm.dragging.as_mut().unwrap().width = 317.25;
+        sm.set_grab_offset(12.25, 8.5);
+        sm.note_drag_geometry(200.5, 90.75, 40.0, 50.0, 0.0);
+        sm.hover_insert(Status::Doing, None);
+        sm.commit_drop();
+
+        let settle = sm.settling.as_mut().unwrap();
+        assert_eq!((settle.from_x, settle.from_y), (188.25, 82.25));
+        assert_eq!(settle.width, 317.25);
+        let first_frame = Instant::now();
+        assert_eq!(settle.progress(first_frame), 0.0);
+        let next_frame = settle.progress(first_frame + Duration::from_millis(16));
+        assert!(next_frame > 0.25, "landing must move promptly, without an ease-in pause");
+        assert_eq!(settle.progress(first_frame + Duration::from_millis(SETTLE_ANIM_MS)), 1.0);
+    }
+
+    #[test]
+    fn same_column_drop_uses_remaining_cards_heights_for_the_landing_target() {
+        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        sm.add_todo_card("A");
+        sm.add_todo_card("B");
+        sm.cards[0].notes = "one\ntwo\nthree".into();
+        let a = sm.cards[0].id.clone();
+        sm.start_drag(&a);
+        sm.note_drag_geometry(200.0, 1000.0, 40.0, 50.0, 0.0);
+        sm.hover_pointer(Status::Todo, 1000.0);
+        let expected_y = 50.0 + sm.dest_pitches(Status::Todo).iter().sum::<f32>();
+        sm.commit_drop();
+        assert_eq!(sm.settling.as_ref().unwrap().to_y, expected_y);
+        assert_eq!(titles(&sm, Status::Todo), vec!["B", "A"]);
+    }
+
+    #[test]
+    fn subpixel_drop_distance_is_animated_instead_of_snapping() {
+        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        sm.add_todo_card("A");
+        let a = ids(&sm, Status::Todo)[0].clone();
+        sm.start_drag(&a);
+        sm.note_drag_geometry(52.5, 50.25, 40.0, 50.0, 0.0);
+        sm.commit_drop();
+        assert_eq!(sm.settling_delta(), Some((0.5, 0.25)));
+        assert!(sm.card_is_hidden(&a));
+    }
+
+    #[test]
+    fn append_drop_uses_its_committed_target_instead_of_the_last_hover_index() {
+        let mut sm = SM_UI::setup(host(), DataManager::open_in_memory().unwrap());
+        sm.add_todo_card("A");
+        sm.add_todo_card("B");
+        let a = ids(&sm, Status::Todo)[0].clone();
+        sm.start_drag(&a);
+        sm.note_drag_geometry(200.0, 90.0, 40.0, 50.0, 0.0);
+        sm.last_hover_status = Some(Status::Todo);
+        sm.last_insert_index = Some(0);
+        let expected_y = 50.0 + sm.dest_pitches(Status::Todo).iter().sum::<f32>();
+        sm.drop_card(&a, Status::Todo, None);
+        assert_eq!(sm.settling.as_ref().unwrap().to_y, expected_y);
+        assert_eq!(titles(&sm, Status::Todo), vec!["B", "A"]);
     }
 
     #[test]
@@ -3267,10 +3449,10 @@ mod tests {
         sm.commit_drop();
         assert_eq!(sm.settling_id(), Some(a.as_str()));
         sm.age_settle_as_if_persist_was_slow();
-        sm.flush();
+        flush(&mut sm);
         assert_eq!(sm.settling_id(), Some(a.as_str()));
         sm.expire_settle();
-        sm.flush();
+        flush(&mut sm);
         assert_eq!(sm.settling_id(), None);
     }
 

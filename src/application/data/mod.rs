@@ -4,7 +4,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use kanban_core::{AppError, Card, Priority, Status, Store};
+mod domain;
+mod error;
+mod store;
+
+pub use domain::{Card, Priority, Status};
+pub use error::AppError;
+use store::Store;
 
 enum PersistJob {
     Move {

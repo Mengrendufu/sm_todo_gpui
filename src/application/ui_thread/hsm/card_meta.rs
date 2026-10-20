@@ -2,7 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use kanban_core::Priority;
+use crate::application::data::Priority;
 
 const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_HOURS: i64 = 24;

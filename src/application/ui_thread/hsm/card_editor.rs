@@ -1,6 +1,6 @@
 //! Editor persist commands. Same split as Tauri `cardEditor.ts`.
 
-use kanban_core::Priority;
+use crate::application::data::Priority;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorKind {
@@ -57,7 +57,7 @@ pub fn command_on_editor_delete(kind: &EditorKind) -> PersistCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kanban_core::Priority;
+    use crate::application::data::Priority;
 
     fn fields() -> EditorFields {
         EditorFields {

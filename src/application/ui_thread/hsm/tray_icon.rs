@@ -1,8 +1,8 @@
 //! Persistent notification-area icon. Same labels and clicks as Tauri `trayIcon`.
 //! No taskbar button changes.
 
-use crate::application::ui_thread::evt::UI_Evt;
-use crate::application::ui_thread::inbox::UI_Inbox_post;
+use crate::application::ui_thread::thread::evt::UI_Evt;
+use crate::application::ui_thread::thread::inbox::UI_Inbox_post;
 
 pub const TRAY_TOOLTIP: &str = "SunnyMatato";
 pub const TRAY_SHOW_LABEL: &str = "显示";
