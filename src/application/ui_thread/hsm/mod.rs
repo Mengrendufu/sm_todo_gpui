@@ -2,17 +2,12 @@
 
 pub mod theme;
 pub mod widgets;
-pub mod window_pin;
 mod state_machine;
-mod edge_dock;
-mod window_chrome;
-mod window_taskbar;
-mod top_edge_dock;
-mod tray_icon;
 
 use widgets::{add_card_button, card, card_section, title};
 use widgets::card::{calendar, editor as card_editor, meta as card_meta, text_field};
 
+use crate::application::ui_thread::window_ops::WindowOps;
 use crate::application::data_manager::DataClient;
 use crate::application::snapshot::Snapshot;
 use crate::application::data_manager::Persistence;
@@ -474,6 +469,7 @@ struct Editor {
 }
 
 pub struct SM_UI {
+    pub(super) window_ops: WindowOps,
     hsm: SM_Hsm<UI_Controls>,
     controls: UI_Controls,
 }
@@ -498,6 +494,7 @@ impl SM_UI {
     pub fn setup(_host: SM_UI_HostOps, snapshot: Snapshot, client: DataClient) -> Self {
         let mut me = Self {
             hsm: SM_Hsm::new(),
+            window_ops: WindowOps::new(),
             controls: UI_Controls::new(snapshot, client),
         };
         UI_Controls::init(&mut me.hsm, &mut me.controls);
@@ -506,10 +503,6 @@ impl SM_UI {
 
     pub fn dispatch_evt(&mut self, e: &UI_Evt) {
         UI_Controls::dispatch(&mut self.hsm, &mut self.controls, e);
-    }
-
-    pub fn uninstall_tray(window: &Window) {
-        tray_icon::uninstall(window);
     }
 
     #[cfg(test)]
@@ -546,7 +539,6 @@ pub struct UI_Controls {
     persistence: Persistence,
     persist_wake_pending: bool,
     closing: bool,
-    pinned: bool,
     dragging: Option<DragSession>,
     holes: Vec<HoleSlot>,
     hole_epoch: u64,
@@ -572,7 +564,6 @@ pub struct UI_Controls {
     calendar_open: bool,
     calendar_year: i32,
     calendar_month: u32,
-    top_dock: top_edge_dock::TopEdgeDock,
 }
 
 impl UI_Controls {
@@ -582,7 +573,6 @@ impl UI_Controls {
             persistence: Persistence::new(client),
             persist_wake_pending: false,
             closing: false,
-            pinned: true,
             dragging: None,
             holes: Vec::new(),
             hole_epoch: 0,
@@ -612,25 +602,11 @@ impl UI_Controls {
             calendar_open: false,
             calendar_year: 2026,
             calendar_month: 1,
-            top_dock: top_edge_dock::TopEdgeDock::new(),
         }
     }
 
-    pub fn is_pinned(&self) -> bool {
-        self.pinned
-    }
-
-    pub fn toggle_pin(&mut self) -> bool {
-        self.pinned = !self.pinned;
-        self.pinned
-    }
-
-    pub fn apply_always_on_top(&self, window: &Window) {
-        window_pin::set_always_on_top(window, self.pinned);
-    }
-
-    pub fn apply_skip_taskbar(&self, window: &Window) {
-        window_taskbar::set_skip_taskbar(window);
+    pub(super) fn dock_hold_open(&self) -> bool {
+        self.editor.is_some() || self.dragging.is_some()
     }
 
     pub fn add_todo_card(&mut self, title: &str) {
@@ -1706,7 +1682,12 @@ impl UI_Controls {
 
 impl Render for SM_UI {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.controls.render_controls(window, cx)
+        // Preserve the first landing frame before scheduling persistence.
+        if let Some(e) = self.controls.flush() {
+            UI_Inbox_post(e);
+        }
+        self.window_ops.sync(self.controls.dock_hold_open(), window, cx);
+        self.controls.render_controls(window, cx, self.window_ops.is_pinned())
     }
 }
 
@@ -1723,15 +1704,7 @@ impl UI_Controls {
         }
     }
 
-    fn render_controls(&mut self, window: &mut Window, cx: &mut Context<SM_UI>) -> impl IntoElement {
-        // Preserve the first landing frame before scheduling persistence.
-        if let Some(e) = self.flush() {
-            UI_Inbox_post(e);
-        }
-        self.wire_top_edge_dock(window, cx);
-        self.sync_window_hover(window, cx);
-        self.sync_dock_hold_open(window, cx);
-        tray_icon::install(window);
+    fn render_controls(&mut self, window: &mut Window, cx: &mut Context<SM_UI>, pinned: bool) -> impl IntoElement {
         if self.editor.is_some() {
             self.ensure_editor_fields(cx, window);
         }
@@ -1776,7 +1749,7 @@ impl UI_Controls {
                     cx.notify();
                 }),
             )
-            .child(self.render_titlebar(window, theme, cx))
+            .child(self.render_titlebar(window, theme, pinned, cx))
             .child(
                 div()
                     .flex()
@@ -1901,12 +1874,6 @@ mod tests {
     }
 
     #[test]
-    fn window_starts_pinned() {
-        let (_database, sm) = test_ui();
-        assert!(sm.is_pinned());
-    }
-
-    #[test]
     fn editor_or_drag_holds_the_top_dock_open() {
         let (_database, mut sm) = test_ui();
         assert!(!sm.dock_hold_open());
@@ -1920,15 +1887,6 @@ mod tests {
         assert!(sm.dock_hold_open());
         sm.cancel_drag();
         assert!(!sm.dock_hold_open());
-    }
-
-    #[test]
-    fn toggle_pin_flips_always_on_top_flag() {
-        let (_database, mut sm) = test_ui();
-        assert!(!sm.toggle_pin());
-        assert!(!sm.is_pinned());
-        assert!(sm.toggle_pin());
-        assert!(sm.is_pinned());
     }
 
     #[test]

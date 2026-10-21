@@ -1,12 +1,12 @@
 //! Top-edge dock intents. Same rules as the Tauri `edgeDock` module.
 
 pub const TOP_SNAP_PX: f32 = 28.0;
-pub const TOP_HOT_EDGE_PX: f32 = 8.0;
-pub const COLLAPSE_DELAY_MS: u64 = 520;
+pub const TOP_HOT_EDGE_PX: f32 = 0.0;
+pub const COLLAPSE_DELAY_MS: u64 = 200;
 pub const TRAY_REVEAL_HOLD_MS: u64 = 1600;
 pub const SETTLE_DELAY_MS: u64 = 180;
 pub const HOT_EDGE_POLL_MS: u64 = 50;
-pub const DOCK_SLIDE_MS: u64 = 220;
+pub const DOCK_SLIDE_MS: u64 = 100;
 pub const DOCK_PREPAINT_MS: u64 = 64;
 pub const APPLY_GUARD_MS: u64 = SETTLE_DELAY_MS + DOCK_SLIDE_MS + 80;
 
@@ -495,12 +495,14 @@ mod tests {
             1200.0,
             WORK
         ));
-        assert!(!is_cursor_on_top_hot_edge(
-            Point { x: 400.0, y: 40.0 },
-            200.0,
-            1200.0,
-            WORK
-        ));
+        for y in [-1.0, 1.0, 8.0, 40.0] {
+            assert!(!is_cursor_on_top_hot_edge(
+                Point { x: 400.0, y },
+                200.0,
+                1200.0,
+                WORK
+            ));
+        }
     }
 
     #[test]

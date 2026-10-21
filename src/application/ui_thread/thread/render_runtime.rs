@@ -10,7 +10,7 @@ use crate::application::data_manager::DataClient;
 use crate::application::snapshot::Snapshot;
 use crate::application::ui_thread::thread::evt::UI_Evt;
 use crate::application::ui_thread::thread::inbox::{
-    UI_Inbox_bind, UI_Inbox_take_all, UI_Inbox_post,
+    UI_Inbox_bind, UI_Inbox_take_all,
 };
 use crate::application::ui_thread::hsm::{SM_UI, SM_UI_HostOps};
 use super::super::window_ops::{DispatchResult, ExitProgress, WindowOps};
@@ -41,10 +41,6 @@ pub fn RenderRuntime_run(wake_rx: Receiver<()>, snapshot: Snapshot, client: Data
                     ..Default::default()
                 },
                 move |window, cx| {
-                    window.on_window_should_close(cx, |_, _| {
-                        UI_Inbox_post(UI_Evt::TrayQuit);
-                        false
-                    });
                     let ui = cx.new(|cx| {
                         cx.observe_window_appearance(window, |_, _, cx| {
                             cx.notify();
@@ -60,14 +56,7 @@ pub fn RenderRuntime_run(wake_rx: Receiver<()>, snapshot: Snapshot, client: Data
                         )
                     });
                     ui.update(cx, |sm, cx| {
-                        sm.apply_always_on_top(window);
-                        sm.apply_skip_taskbar(window);
-                        cx.observe_window_activation(window, |this, window, _cx| {
-                            if window.is_window_active() {
-                                this.apply_skip_taskbar(window);
-                            }
-                        })
-                        .detach();
+                        sm.window_ops.attach(window, cx);
                         cx.notify();
                     });
                     ui
@@ -86,7 +75,7 @@ pub fn RenderRuntime_run(wake_rx: Receiver<()>, snapshot: Snapshot, client: Data
                         }
                     }
                     if WindowOps::advance_exit(sm, window, cx) == ExitProgress::ExitReady {
-                        SM_UI::uninstall_tray(window);
+                        WindowOps::detach(window);
                         window.remove_window();
                         cx.quit();
                     } else {

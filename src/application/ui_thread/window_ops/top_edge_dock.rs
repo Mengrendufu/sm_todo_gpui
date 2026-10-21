@@ -8,12 +8,13 @@ use super::edge_dock::{
     apply_intent, collapse_should_wait_for_settle, intent_after_pointer_enter,
     intent_after_pointer_leave, intent_after_settle, is_cursor_on_top_hot_edge, is_point_in_rect,
     remember_expanded_size, should_arm_collapse_on_hold_release, should_collapse_after_tray_reveal,
-    should_skip_settle, slide_down_y, slide_up_y, tray_reveal_plan, APPLY_GUARD_MS,
-    COLLAPSE_DELAY_MS, DOCK_PREPAINT_MS, DOCK_SLIDE_MS, HOT_EDGE_POLL_MS, SETTLE_DELAY_MS,
-    TRAY_REVEAL_HOLD_MS, DockAction, DockIntent, DockMode, DockSession, Rect, Size, TrayRevealPlan,
+    should_skip_settle, slide_down_y, slide_up_y, tray_reveal_plan, DockAction, DockIntent,
+    DockMode, DockSession, Rect, Size, TrayRevealPlan, APPLY_GUARD_MS, COLLAPSE_DELAY_MS,
+    DOCK_PREPAINT_MS, DOCK_SLIDE_MS, HOT_EDGE_POLL_MS, SETTLE_DELAY_MS, TRAY_REVEAL_HOLD_MS,
 };
 use super::window_chrome::{self, SlideFrame};
-use super::{SM_UI, UI_Controls};
+use super::WindowOps;
+use crate::application::ui_thread::hsm::SM_UI;
 
 pub struct TopEdgeDock {
     session: DockSession,
@@ -61,14 +62,10 @@ impl TopEdgeDock {
     }
 }
 
-impl UI_Controls {
+impl WindowOps {
     pub(crate) fn hide_to_tray(&mut self, window: &Window) {
         self.top_dock.suspend_for_tray();
         window_chrome::hide(window);
-    }
-
-    pub(super) fn dock_hold_open(&self) -> bool {
-        self.editor.is_some() || self.dragging.is_some()
     }
 
     pub(super) fn wire_top_edge_dock(&mut self, window: &mut Window, cx: &mut Context<SM_UI>) {
@@ -77,7 +74,8 @@ impl UI_Controls {
         }
         self.top_dock.wired = true;
         cx.observe_window_bounds(window, |this, window, cx| {
-            this.note_window_moved(window, cx);
+            this.window_ops.hold_open = this.dock_hold_open();
+            this.window_ops.note_window_moved(window, cx);
         })
         .detach();
     }
@@ -96,7 +94,7 @@ impl UI_Controls {
         if self.top_dock.hidden_to_tray {
             return;
         }
-        let hold_open = self.dock_hold_open();
+        let hold_open = self.hold_open;
         let was = self.top_dock.last_hold_open;
         self.top_dock.last_hold_open = hold_open;
         if hold_open {
@@ -150,7 +148,7 @@ impl UI_Controls {
         let over = window_chrome::cursor_point(window)
             .is_some_and(|cursor| is_point_in_rect(cursor, box_));
         self.top_dock.pointer_inside = over;
-        if should_collapse_after_tray_reveal(over, self.dock_hold_open()) {
+        if should_collapse_after_tray_reveal(over, self.hold_open) {
             self.schedule_collapse(window, cx, TRAY_REVEAL_HOLD_MS);
         }
     }
@@ -176,7 +174,7 @@ impl UI_Controls {
             self.expand_now(window, cx);
             return;
         }
-        if self.dock_hold_open() {
+        if self.hold_open {
             return;
         }
         self.schedule_collapse(window, cx, COLLAPSE_DELAY_MS);
@@ -188,10 +186,11 @@ impl UI_Controls {
         cx.spawn_in(window, async move |this, cx| {
             Timer::after(Duration::from_millis(SETTLE_DELAY_MS)).await;
             this.update_in(cx, |this, window, cx| {
-                if this.top_dock.settle_gen != gen {
+                this.window_ops.hold_open = this.dock_hold_open();
+                if this.window_ops.top_dock.settle_gen != gen {
                     return;
                 }
-                this.run_settle(window, cx);
+                this.window_ops.run_settle(window, cx);
             })
             .ok();
         })
@@ -204,10 +203,11 @@ impl UI_Controls {
         cx.spawn_in(window, async move |this, cx| {
             Timer::after(Duration::from_millis(delay_ms)).await;
             this.update_in(cx, |this, window, cx| {
-                if this.top_dock.collapse_gen != gen {
+                this.window_ops.hold_open = this.dock_hold_open();
+                if this.window_ops.top_dock.collapse_gen != gen {
                     return;
                 }
-                this.run_collapse(window, cx);
+                this.window_ops.run_collapse(window, cx);
             })
             .ok();
         })
@@ -221,8 +221,9 @@ impl UI_Controls {
         cx.spawn_in(window, async move |this, cx| {
             Timer::after(Duration::from_millis(APPLY_GUARD_MS)).await;
             this.update(cx, |this, _cx| {
-                if this.top_dock.apply_gen == gen {
-                    this.top_dock.applying = false;
+                this.window_ops.hold_open = this.dock_hold_open();
+                if this.window_ops.top_dock.apply_gen == gen {
+                    this.window_ops.top_dock.applying = false;
                 }
             })
             .ok();
@@ -255,10 +256,15 @@ impl UI_Controls {
     }
 
     fn run_collapse(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
-        if self.top_dock.hidden_to_tray || self.dock_hold_open() || self.top_dock.pointer_inside {
+        if self.top_dock.hidden_to_tray || self.hold_open || self.top_dock.pointer_inside {
             return;
         }
-        let elapsed_ms = self.top_dock.last_moved_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let elapsed_ms = self
+            .top_dock
+            .last_moved_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
         if collapse_should_wait_for_settle(elapsed_ms) {
             self.schedule_collapse(window, cx, COLLAPSE_DELAY_MS);
             return;
@@ -271,7 +277,7 @@ impl UI_Controls {
             self.top_dock.session.mode,
             box_,
             work,
-            self.dock_hold_open(),
+            self.hold_open,
             window_chrome::is_minimized(window),
         );
         self.apply_now(intent, window, cx);
@@ -337,23 +343,22 @@ impl UI_Controls {
     fn start_hot_edge_poll(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
         self.top_dock.poll_gen = self.top_dock.poll_gen.wrapping_add(1);
         let gen = self.top_dock.poll_gen;
-        cx.spawn_in(window, async move |this, cx| {
-            loop {
-                Timer::after(Duration::from_millis(HOT_EDGE_POLL_MS)).await;
-                let keep = this
-                    .update_in(cx, |this, window, cx| {
-                        if this.top_dock.poll_gen != gen
-                            || this.top_dock.session.mode != DockMode::Collapsed
-                        {
-                            return false;
-                        }
-                        this.poll_hot_edge_once(window, cx);
-                        true
-                    })
-                    .unwrap_or(false);
-                if !keep {
-                    break;
-                }
+        cx.spawn_in(window, async move |this, cx| loop {
+            Timer::after(Duration::from_millis(HOT_EDGE_POLL_MS)).await;
+            let keep = this
+                .update_in(cx, |this, window, cx| {
+                    this.window_ops.hold_open = this.dock_hold_open();
+                    if this.window_ops.top_dock.poll_gen != gen
+                        || this.window_ops.top_dock.session.mode != DockMode::Collapsed
+                    {
+                        return false;
+                    }
+                    this.window_ops.poll_hot_edge_once(window, cx);
+                    true
+                })
+                .unwrap_or(false);
+            if !keep {
+                break;
             }
         })
         .detach();
@@ -389,33 +394,36 @@ impl UI_Controls {
             if hide {
                 let Some(frame) = this
                     .update_in(cx, |this, window, _cx| {
-                        if this.top_dock.slide_gen != gen {
+                        this.window_ops.hold_open = this.dock_hold_open();
+                        if this.window_ops.top_dock.slide_gen != gen {
                             return None;
                         }
                         let frame = window_chrome::begin_slide_hide(window)?;
-                        this.top_dock.slide_frame = Some(frame);
+                        this.window_ops.top_dock.slide_frame = Some(frame);
                         Some(frame)
                     })
                     .ok()
                     .flatten()
                 else {
                     this.update_in(cx, |this, window, cx| {
-                        if this.top_dock.slide_gen != gen {
+                        this.window_ops.hold_open = this.dock_hold_open();
+                        if this.window_ops.top_dock.slide_gen != gen {
                             return;
                         }
                         window_chrome::hide(window);
-                        this.start_hot_edge_poll(window, cx);
+                        this.window_ops.start_hot_edge_poll(window, cx);
                     })
                     .ok();
                     return;
                 };
                 animate_slide(this.clone(), cx, gen, frame, true).await;
                 this.update_in(cx, |this, window, cx| {
-                    if this.top_dock.slide_gen != gen {
+                    this.window_ops.hold_open = this.dock_hold_open();
+                    if this.window_ops.top_dock.slide_gen != gen {
                         return;
                     }
                     window_chrome::finish_slide_hide(window, &frame);
-                    this.start_hot_edge_poll(window, cx);
+                    this.window_ops.start_hot_edge_poll(window, cx);
                 })
                 .ok();
                 return;
@@ -423,10 +431,11 @@ impl UI_Controls {
 
             let Some(frame) = this
                 .update_in(cx, |this, window, _cx| {
-                    if this.top_dock.slide_gen != gen {
+                    this.window_ops.hold_open = this.dock_hold_open();
+                    if this.window_ops.top_dock.slide_gen != gen {
                         return None;
                     }
-                    let frame = this.top_dock.slide_frame?;
+                    let frame = this.window_ops.top_dock.slide_frame?;
                     if !window_chrome::begin_slide_show(window, &frame) {
                         window_chrome::show(window);
                         return None;
@@ -441,7 +450,8 @@ impl UI_Controls {
             Timer::after(Duration::from_millis(DOCK_PREPAINT_MS)).await;
             animate_slide(this.clone(), cx, gen, frame, false).await;
             this.update_in(cx, |this, window, _cx| {
-                if this.top_dock.slide_gen != gen {
+                this.window_ops.hold_open = this.dock_hold_open();
+                if this.window_ops.top_dock.slide_gen != gen {
                     return;
                 }
                 window_chrome::set_slide_y(window, frame.x, frame.rest_y);
@@ -471,7 +481,8 @@ async fn animate_slide(
         };
         let cancelled = this
             .update_in(cx, |this, window, _cx| {
-                if this.top_dock.slide_gen != gen {
+                this.window_ops.hold_open = this.dock_hold_open();
+                if this.window_ops.top_dock.slide_gen != gen {
                     return true;
                 }
                 window_chrome::set_slide_y(window, frame.x, y);

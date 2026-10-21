@@ -57,15 +57,16 @@ impl UI_Controls {
         &self,
         window: &Window,
         theme: theme::Theme,
+        pinned: bool,
         cx: &mut Context<SM_UI>,
     ) -> impl IntoElement {
         let active = window.is_window_active();
         let close = if active { 0xff5f57 } else { theme.traffic_dim };
         let min = if active { 0xfebc2e } else { theme.traffic_dim };
         let max = if active { 0x28c840 } else { theme.traffic_dim };
-        let pin_bg = theme.pin_bg(self.pinned);
-        let pin_fg = theme.pin_fg(self.pinned);
-        let pin_hover = theme.pin_hover(self.pinned);
+        let pin_bg = theme.pin_bg(pinned);
+        let pin_fg = theme.pin_fg(pinned);
+        let pin_hover = theme.pin_hover(pinned);
         div()
             .relative()
             .flex()
@@ -115,7 +116,7 @@ impl UI_Controls {
                         UI_Inbox_post(UI_Evt::TogglePin);
                         cx.notify();
                     }))
-                    .child(if self.pinned { "●" } else { "○" }),
+                    .child(if pinned { "●" } else { "○" }),
             )
     }
 }
