@@ -237,6 +237,12 @@ impl WindowOps {
         {
             return;
         }
+        // A pause in native dragging is not a release. Keep the dock context
+        // unchanged until Windows leaves its move/size loop.
+        if window_chrome::is_moving_or_resizing(window) {
+            self.schedule_settle(window, cx);
+            return;
+        }
         let Some(work) = window_chrome::work_area(window, cx) else {
             return;
         };
@@ -257,6 +263,10 @@ impl WindowOps {
 
     fn run_collapse(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
         if self.top_dock.hidden_to_tray || self.hold_open || self.top_dock.pointer_inside {
+            return;
+        }
+        if window_chrome::is_moving_or_resizing(window) {
+            self.schedule_collapse(window, cx, COLLAPSE_DELAY_MS);
             return;
         }
         let elapsed_ms = self

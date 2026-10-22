@@ -769,7 +769,7 @@ impl UI_Controls {
 
     fn ensure_editor_fields(&mut self, cx: &mut Context<SM_UI>, window: &mut Window) {
         if self.title_field.is_none() {
-            self.title_field = Some(cx.new(|cx| text_field::TextField::new(cx, "", 22.0, false)));
+            self.title_field = Some(cx.new(|cx| text_field::TextField::new(cx, "", 44.0, true)));
             self.notes_field = Some(cx.new(|cx| text_field::TextField::new(cx, "", 96.0, true)));
         }
         if !self.fields_dirty {

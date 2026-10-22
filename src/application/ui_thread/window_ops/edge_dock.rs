@@ -119,6 +119,15 @@ pub fn intent_after_settle(
             rect: visible_undock_rect(box_, work, remembered),
         };
     }
+    if mode == DockMode::Expanded && box_.y != work.y {
+        return DockIntent::Dock {
+            rect: Rect { y: work.y, ..box_ },
+            remember: Size {
+                width: box_.width,
+                height: box_.height,
+            },
+        };
+    }
     DockIntent::None
 }
 
@@ -314,6 +323,39 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn moving_an_expanded_dock_within_snap_range_realigns_to_the_work_top() {
+        let work = Rect { y: 100.0, ..WORK };
+        for offset in [-12.0, TOP_SNAP_PX] {
+            let moved = Rect {
+                y: work.y + offset,
+                ..BOARD
+            };
+            let mut session = DockSession::new();
+            session.mode = DockMode::Expanded;
+            let intent = intent_after_settle(session.mode, moved, work, None, false, false);
+            assert_eq!(
+                apply_intent(&mut session, intent),
+                DockAction::ShowAt {
+                    x: moved.x,
+                    y: work.y
+                }
+            );
+            assert_eq!(session.mode, DockMode::Expanded);
+            assert_eq!(
+                intent_after_settle(
+                    session.mode,
+                    Rect { y: work.y, ..moved },
+                    work,
+                    session.remembered,
+                    false,
+                    false,
+                ),
+                DockIntent::None
+            );
+        }
     }
 
     #[test]

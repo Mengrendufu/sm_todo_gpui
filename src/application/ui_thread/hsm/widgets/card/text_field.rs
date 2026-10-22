@@ -1,13 +1,13 @@
-//! Editor text field: IME, clip to bounds, optional wrap + Enter.
+//! Wrapped card editor input with vertical scrolling, caret tracking and IME.
 
 use std::ops::Range;
 
 use gpui::{
-    actions, div, fill, point, prelude::*, px, relative, size, App, Bounds,
-    ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, SharedString, Style,
-    TextRun, UTF16Selection, UnderlineStyle, Window,
+    actions, div, fill, point, prelude::*, px, relative, size, App, Bounds, ClipboardItem, Context,
+    CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
+    Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, Pixels, Point, ScrollWheelEvent, SharedString, Style, TextRun,
+    UTF16Selection, UnderlineStyle, Window,
 };
 
 use crate::application::ui_thread::hsm::theme::Theme;
@@ -19,6 +19,8 @@ actions!(
         Delete,
         Left,
         Right,
+        Up,
+        Down,
         SelectLeft,
         SelectRight,
         SelectAll,
@@ -37,6 +39,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("delete", Delete, Some("CardField")),
         KeyBinding::new("left", Left, Some("CardField")),
         KeyBinding::new("right", Right, Some("CardField")),
+        KeyBinding::new("up", Up, Some("CardField")),
+        KeyBinding::new("down", Down, Some("CardField")),
         KeyBinding::new("shift-left", SelectLeft, Some("CardField")),
         KeyBinding::new("shift-right", SelectRight, Some("CardField")),
         KeyBinding::new("home", Home, Some("CardField")),
@@ -76,10 +80,18 @@ pub struct TextField {
     last_lines: Vec<gpui::WrappedLine>,
     last_starts: Vec<usize>,
     last_line_height: Pixels,
+    scroll_y: Pixels,
+    content_height: Pixels,
+    reveal_cursor: bool,
 }
 
 impl TextField {
-    pub fn new(cx: &mut Context<Self>, placeholder: &str, min_height: f32, multiline: bool) -> Self {
+    pub fn new(
+        cx: &mut Context<Self>,
+        placeholder: &str,
+        min_height: f32,
+        multiline: bool,
+    ) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
             content: "".into(),
@@ -94,6 +106,9 @@ impl TextField {
             last_lines: Vec::new(),
             last_starts: Vec::new(),
             last_line_height: px(20.),
+            scroll_y: px(0.),
+            content_height: px(0.),
+            reveal_cursor: true,
         }
     }
 
@@ -107,6 +122,8 @@ impl TextField {
         self.selected_range = len..len;
         self.selection_reversed = false;
         self.marked_range = None;
+        self.scroll_y = px(0.);
+        self.reveal_cursor = true;
         cx.notify();
     }
 
@@ -126,6 +143,57 @@ impl TextField {
         }
     }
 
+    fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_vertical(-1., cx);
+    }
+
+    fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_vertical(1., cx);
+    }
+
+    fn move_vertical(&mut self, direction: f32, cx: &mut Context<Self>) {
+        let position = text_position(
+            &self.last_lines,
+            &self.last_starts,
+            self.cursor_offset(),
+            self.last_line_height,
+        );
+        let index = index_at_position(
+            &self.last_lines,
+            &self.last_starts,
+            point(
+                position.x,
+                position.y + self.last_line_height * (direction + 0.5),
+            ),
+            self.last_line_height,
+        )
+        .min(self.content.len());
+        self.move_to(index, cx);
+    }
+
+    fn on_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bounds) = self.last_bounds else {
+            return;
+        };
+        let next = scroll_offset(
+            self.scroll_y - event.delta.pixel_delta(self.last_line_height).y,
+            bounds.size.height,
+            self.content_height,
+            None,
+        );
+        if next != self.scroll_y {
+            self.scroll_y = next;
+            self.reveal_cursor = false;
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.select_to(self.previous_boundary(self.cursor_offset()), cx);
     }
@@ -141,10 +209,7 @@ impl TextField {
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
         let off = self.cursor_offset();
-        let start = self.content[..off]
-            .rfind('\n')
-            .map(|i| i + 1)
-            .unwrap_or(0);
+        let start = self.content[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
         self.move_to(start, cx);
     }
 
@@ -226,6 +291,7 @@ impl TextField {
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
+        self.reveal_cursor = true;
         cx.notify();
     }
 
@@ -247,23 +313,16 @@ impl TextField {
         if self.last_lines.is_empty() {
             return 0;
         }
-        let local = point(position.x - bounds.left(), position.y - bounds.top());
-        let line_h = self.last_line_height;
-        let mut y = px(0.);
-        for (i, line) in self.last_lines.iter().enumerate() {
-            let h = line.size(line_h).height;
-            let last = i + 1 == self.last_lines.len();
-            if local.y <= y + h || last {
-                let pos = point(local.x, (local.y - y).max(px(0.)));
-                let idx = line
-                    .closest_index_for_position(pos, line_h)
-                    .unwrap_or_else(|idx| idx);
-                let start = self.last_starts.get(i).copied().unwrap_or(0);
-                return (start + idx).min(self.content.len());
-            }
-            y += h;
-        }
-        self.content.len()
+        index_at_position(
+            &self.last_lines,
+            &self.last_starts,
+            point(
+                position.x - bounds.left(),
+                position.y - bounds.top() + self.scroll_y,
+            ),
+            self.last_line_height,
+        )
+        .min(self.content.len())
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -276,6 +335,7 @@ impl TextField {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+        self.reveal_cursor = true;
         cx.notify();
     }
 
@@ -388,6 +448,7 @@ impl EntityInputHandler for TextField {
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
+        self.reveal_cursor = true;
         cx.notify();
     }
 
@@ -417,6 +478,7 @@ impl EntityInputHandler for TextField {
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .map(|new_range| new_range.start + range.start..new_range.end + range.end)
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.reveal_cursor = true;
         cx.notify();
     }
 
@@ -428,31 +490,16 @@ impl EntityInputHandler for TextField {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let range = self.range_from_utf16(&range_utf16);
-        let idx = range.start;
-        let line_h = self.last_line_height;
-        let mut y = px(0.);
-        for (i, line) in self.last_lines.iter().enumerate() {
-            let start = self.last_starts.get(i).copied().unwrap_or(0);
-            let end = start + line.len();
-            let last = i + 1 == self.last_lines.len();
-            if idx <= end || last {
-                let local = idx.saturating_sub(start).min(line.len());
-                let pos = line
-                    .position_for_index(local, line_h)
-                    .unwrap_or(point(px(0.), px(0.)));
-                return Some(Bounds::from_corners(
-                    point(bounds.left() + pos.x, bounds.top() + y + pos.y),
-                    point(
-                        bounds.left() + pos.x + px(2.),
-                        bounds.top() + y + pos.y + line_h,
-                    ),
-                ));
-            }
-            y += line.size(line_h).height;
-        }
-        Some(Bounds::from_corners(
-            point(bounds.left(), bounds.top()),
-            point(bounds.left() + px(2.), bounds.top() + line_h),
+        let position = text_position(
+            &self.last_lines,
+            &self.last_starts,
+            range.start,
+            self.last_line_height,
+        );
+        let origin = self.last_bounds.unwrap_or(bounds).origin;
+        Some(Bounds::new(
+            point(origin.x + position.x, origin.y + position.y - self.scroll_y),
+            size(px(2.), self.last_line_height),
         ))
     }
 
@@ -464,6 +511,88 @@ impl EntityInputHandler for TextField {
     ) -> Option<usize> {
         Some(self.offset_to_utf16(self.index_for_mouse_position(point)))
     }
+}
+
+fn text_position(
+    lines: &[gpui::WrappedLine],
+    starts: &[usize],
+    index: usize,
+    line_height: Pixels,
+) -> Point<Pixels> {
+    let mut y = px(0.);
+    for (i, line) in lines.iter().enumerate() {
+        let start = starts.get(i).copied().unwrap_or(0);
+        if index <= start + line.len() || i + 1 == lines.len() {
+            let local = index.saturating_sub(start).min(line.len());
+            let position = line
+                .position_for_index(local, line_height)
+                .unwrap_or(point(px(0.), px(0.)));
+            return point(position.x, y + position.y);
+        }
+        y += line.size(line_height).height;
+    }
+    point(px(0.), y)
+}
+
+fn index_at_position(
+    lines: &[gpui::WrappedLine],
+    starts: &[usize],
+    position: Point<Pixels>,
+    line_height: Pixels,
+) -> usize {
+    let mut y = px(0.);
+    for (i, line) in lines.iter().enumerate() {
+        let height = line.size(line_height).height;
+        if position.y < y + height || i + 1 == lines.len() {
+            let index = line
+                .closest_index_for_position(
+                    point(position.x, (position.y - y).max(px(0.))),
+                    line_height,
+                )
+                .unwrap_or_else(|index| index);
+            return starts.get(i).copied().unwrap_or(0) + index;
+        }
+        y += height;
+    }
+    0
+}
+
+fn scroll_offset(
+    current: Pixels,
+    viewport: Pixels,
+    content: Pixels,
+    caret: Option<(Pixels, Pixels)>,
+) -> Pixels {
+    let max = (content - viewport).max(px(0.));
+    let mut offset = current.clamp(px(0.), max);
+    if let Some((top, height)) = caret {
+        if top < offset {
+            offset = top;
+        } else if top + height > offset + viewport {
+            offset = top + height - viewport;
+        }
+    }
+    offset.clamp(px(0.), max)
+}
+
+fn selection_rects(
+    start: Point<Pixels>,
+    end: Point<Pixels>,
+    width: Pixels,
+    line_height: Pixels,
+) -> Vec<Bounds<Pixels>> {
+    let mut rects = Vec::new();
+    let mut y = start.y;
+    while y <= end.y {
+        let left = if y == start.y { start.x } else { px(0.) };
+        let right = if y == end.y { end.x } else { width };
+        rects.push(Bounds::new(
+            point(left, y),
+            size((right - left).max(px(2.)), line_height),
+        ));
+        y += line_height;
+    }
+    rects
 }
 
 fn paragraph_starts(lines: &[gpui::WrappedLine]) -> Vec<usize> {
@@ -488,7 +617,9 @@ struct PrepaintState {
     starts: Vec<usize>,
     line_height: Pixels,
     cursor: Option<PaintQuad>,
-    selection: Option<PaintQuad>,
+    selection: Vec<PaintQuad>,
+    scroll_y: Pixels,
+    content_height: Pixels,
 }
 
 impl IntoElement for TextElement {
@@ -580,11 +711,8 @@ impl Element for TextElement {
             vec![run]
         };
         let font_size = style.font_size.to_pixels(window.rem_size());
-        let wrap = if input.multiline {
-            Some(bounds.size.width)
-        } else {
-            None
-        };
+        // Both fields wrap visually; multiline only controls explicit newlines.
+        let wrap = Some((bounds.size.width - px(6.)).max(px(1.)));
         let lines: Vec<gpui::WrappedLine> = window
             .text_system()
             .shape_text(display_text, font_size, &runs, wrap, None)
@@ -593,60 +721,54 @@ impl Element for TextElement {
             .collect();
         let starts = paragraph_starts(&lines);
         let line_h = window.line_height();
-        let pos_for = |idx: usize| {
-            let mut y = px(0.);
-            for (i, line) in lines.iter().enumerate() {
-                let start = starts.get(i).copied().unwrap_or(0);
-                let end = start + line.len();
-                let last = i + 1 == lines.len();
-                if idx <= end || last {
-                    let local = idx.saturating_sub(start).min(line.len());
-                    let p = line
-                        .position_for_index(local, line_h)
-                        .unwrap_or(point(px(0.), px(0.)));
-                    return point(p.x, y + p.y);
-                }
-                y += line.size(line_h).height;
-            }
-            point(px(0.), y)
-        };
+        let content_height = lines
+            .iter()
+            .fold(px(0.), |height, line| height + line.size(line_h).height);
+        let caret_position = text_position(&lines, &starts, cursor, line_h);
+        let scroll_y = scroll_offset(
+            input.scroll_y,
+            bounds.size.height,
+            content_height,
+            input.reveal_cursor.then_some((caret_position.y, line_h)),
+        );
+        let origin = point(bounds.left(), bounds.top() - scroll_y);
         let (selection, cursor_quad) = if selected_range.is_empty() {
-            let p = pos_for(cursor);
             (
-                None,
+                Vec::new(),
                 Some(fill(
-                    Bounds::new(
-                        point(bounds.left() + p.x, bounds.top() + p.y),
-                        size(px(2.), line_h),
-                    ),
+                    Bounds::new(origin + caret_position, size(px(2.), line_h)),
                     theme.gold(),
                 )),
             )
         } else {
-            let a = pos_for(selected_range.start);
-            let b = pos_for(selected_range.end);
-            let top_left = point(
-                bounds.left() + a.x.min(b.x),
-                bounds.top() + a.y.min(b.y),
-            );
-            let bottom_right = point(
-                bounds.left() + a.x.max(b.x).max(a.x + px(2.)),
-                bounds.top() + a.y.max(b.y) + line_h,
-            );
+            let start = text_position(&lines, &starts, selected_range.start, line_h);
+            let end = text_position(&lines, &starts, selected_range.end, line_h);
             (
-                Some(fill(
-                    Bounds::from_corners(top_left, bottom_right),
-                    theme.gold_soft(),
-                )),
+                selection_rects(start, end, bounds.size.width, line_h)
+                    .into_iter()
+                    .map(|rect| {
+                        fill(
+                            Bounds::new(origin + rect.origin, rect.size),
+                            theme.gold_soft(),
+                        )
+                    })
+                    .collect(),
                 None,
             )
         };
+        self.input.update(cx, |input, _cx| {
+            input.scroll_y = scroll_y;
+            input.content_height = content_height;
+            input.reveal_cursor = false;
+        });
         PrepaintState {
             lines,
             starts,
             line_height: line_h,
             cursor: cursor_quad,
             selection,
+            scroll_y,
+            content_height,
         }
     }
 
@@ -667,11 +789,11 @@ impl Element for TextElement {
             cx,
         );
         let line_h = prepaint.line_height;
-        window.paint_layer(bounds, |window| {
-            if let Some(selection) = prepaint.selection.take() {
+        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+            for selection in prepaint.selection.drain(..) {
                 window.paint_quad(selection);
             }
-            let mut origin = bounds.origin;
+            let mut origin = point(bounds.left(), bounds.top() - prepaint.scroll_y);
             for line in &prepaint.lines {
                 let _ = line.paint(
                     origin,
@@ -687,6 +809,21 @@ impl Element for TextElement {
                 if let Some(cursor) = prepaint.cursor.take() {
                     window.paint_quad(cursor);
                 }
+            }
+            if prepaint.content_height > bounds.size.height {
+                let thumb_height = (bounds.size.height
+                    * (bounds.size.height / prepaint.content_height))
+                    .max(px(12.))
+                    .min(bounds.size.height);
+                let top = (bounds.size.height - thumb_height)
+                    * (prepaint.scroll_y / (prepaint.content_height - bounds.size.height));
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(bounds.right() - px(3.), bounds.top() + top),
+                        size(px(3.), thumb_height),
+                    ),
+                    Theme::for_window(window).line_strong(),
+                ));
             }
         });
         let lines = prepaint.lines.clone();
@@ -718,6 +855,8 @@ impl Render for TextField {
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))
+            .on_action(cx.listener(Self::up))
+            .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
             .on_action(cx.listener(Self::select_all))
@@ -731,6 +870,7 @@ impl Render for TextField {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .w_full()
             .min_w_0()
             .overflow_hidden()
@@ -742,9 +882,7 @@ impl Render for TextField {
             .py_2()
             .text_sm()
             .text_color(theme.ink())
-            .child(TextElement {
-                input: cx.entity(),
-            })
+            .child(TextElement { input: cx.entity() })
     }
 }
 
@@ -766,5 +904,45 @@ mod tests {
     #[test]
     fn multiline_paste_keeps_newlines() {
         assert_eq!(sanitize_paste("a\nb\r\nc", true), "a\nb\nc");
+    }
+
+    #[test]
+    fn caret_navigation_reveals_the_whole_visual_line() {
+        let bottom = scroll_offset(px(0.), px(44.), px(200.), Some((px(180.), px(20.))));
+        assert_eq!(bottom, px(156.));
+        assert_eq!(
+            scroll_offset(bottom, px(44.), px(200.), Some((px(0.), px(20.)))),
+            px(0.)
+        );
+    }
+
+    #[test]
+    fn manual_scroll_is_preserved_until_the_caret_moves() {
+        assert_eq!(scroll_offset(px(80.), px(44.), px(200.), None), px(80.));
+        assert_eq!(scroll_offset(px(-20.), px(44.), px(200.), None), px(0.));
+        assert_eq!(scroll_offset(px(500.), px(44.), px(200.), None), px(156.));
+    }
+
+    #[test]
+    fn deleting_overflowing_content_resets_the_scroll() {
+        assert_eq!(scroll_offset(px(156.), px(44.), px(20.), None), px(0.));
+    }
+
+    #[test]
+    fn wrapped_selection_uses_separate_visual_rows() {
+        let rects = selection_rects(
+            point(px(30.), px(0.)),
+            point(px(15.), px(40.)),
+            px(100.),
+            px(20.),
+        );
+        assert_eq!(
+            rects,
+            vec![
+                Bounds::new(point(px(30.), px(0.)), size(px(70.), px(20.))),
+                Bounds::new(point(px(0.), px(20.)), size(px(100.), px(20.))),
+                Bounds::new(point(px(0.), px(40.)), size(px(15.), px(20.))),
+            ]
+        );
     }
 }

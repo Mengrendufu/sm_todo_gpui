@@ -67,6 +67,18 @@ pub fn is_minimized(window: &Window) -> bool {
     }
 }
 
+pub fn is_moving_or_resizing(window: &Window) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        return windows_impl::is_moving_or_resizing(window);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        false
+    }
+}
+
 pub fn show(window: &Window) {
     #[cfg(target_os = "windows")]
     windows_impl::show(window, false);
@@ -149,7 +161,8 @@ mod windows_impl {
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetCursorPos, GetWindowRect, IsIconic, SetWindowPos, ShowWindow, SWP_NOACTIVATE,
+        GetCursorPos, GetGUIThreadInfo, GetWindowRect, GetWindowThreadProcessId, IsIconic,
+        SetWindowPos, ShowWindow, GUITHREADINFO, GUI_INMOVESIZE, SWP_NOACTIVATE,
         SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE,
     };
 
@@ -228,6 +241,20 @@ mod windows_impl {
 
     pub(super) fn is_minimized(window: &Window) -> bool {
         hwnd_of(window).is_some_and(|hwnd| unsafe { IsIconic(hwnd) }.as_bool())
+    }
+
+    pub(super) fn is_moving_or_resizing(window: &Window) -> bool {
+        let Some(hwnd) = hwnd_of(window) else {
+            return false;
+        };
+        let thread_id = unsafe { GetWindowThreadProcessId(hwnd, None) };
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        unsafe { GetGUIThreadInfo(thread_id, &mut info) }.is_ok()
+            && info.flags.contains(GUI_INMOVESIZE)
+            && info.hwndMoveSize == hwnd
     }
 
     pub(super) fn show(window: &Window, activate: bool) {
