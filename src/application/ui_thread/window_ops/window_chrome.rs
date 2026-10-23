@@ -86,11 +86,11 @@ pub fn show(window: &Window) {
     let _ = window;
 }
 
-pub fn restore(window: &Window) {
+pub fn restore(window: &Window, maximized: bool) {
     #[cfg(target_os = "windows")]
-    windows_impl::restore(window);
+    windows_impl::restore(window, maximized);
     #[cfg(not(target_os = "windows"))]
-    let _ = window;
+    let _ = (window, maximized);
 }
 
 pub fn hide(window: &Window) {
@@ -163,7 +163,7 @@ mod windows_impl {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetCursorPos, GetGUIThreadInfo, GetWindowRect, GetWindowThreadProcessId, IsIconic,
         SetWindowPos, ShowWindow, GUITHREADINFO, GUI_INMOVESIZE, SWP_NOACTIVATE,
-        SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE,
+        SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE,
     };
 
     use super::{Point, Rect, SlideFrame};
@@ -265,11 +265,11 @@ mod windows_impl {
         let _ = unsafe { ShowWindow(hwnd, cmd) };
     }
 
-    pub(super) fn restore(window: &Window) {
+    pub(super) fn restore(window: &Window, maximized: bool) {
         let Some(hwnd) = hwnd_of(window) else {
             return;
         };
-        let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+        let _ = unsafe { ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_RESTORE }) };
         let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
     }
 

@@ -1,4 +1,4 @@
-//! Top-edge auto-hide. Same rules as Tauri `useTopEdgeDock`, top edge only.
+//! GPUI/native adapter for the WindowOps behavior state machine.
 
 use std::time::{Duration, Instant};
 
@@ -8,20 +8,20 @@ use super::edge_dock::{
     apply_intent, collapse_should_wait_for_settle, intent_after_pointer_enter,
     intent_after_pointer_leave, intent_after_settle, is_cursor_on_top_hot_edge, is_point_in_rect,
     remember_expanded_size, should_arm_collapse_on_hold_release, should_collapse_after_tray_reveal,
-    should_skip_settle, slide_down_y, slide_up_y, tray_reveal_plan, DockAction, DockIntent,
-    DockMode, DockSession, Rect, Size, TrayRevealPlan, APPLY_GUARD_MS, COLLAPSE_DELAY_MS,
-    DOCK_PREPAINT_MS, DOCK_SLIDE_MS, HOT_EDGE_POLL_MS, SETTLE_DELAY_MS, TRAY_REVEAL_HOLD_MS,
+    slide_down_y, slide_up_y, tray_reveal_plan, DockAction, DockIntent, DockMode, DockSession,
+    Rect, Size, TrayRevealPlan, COLLAPSE_DELAY_MS, DOCK_PREPAINT_MS, DOCK_SLIDE_MS,
+    HOT_EDGE_POLL_MS, SETTLE_DELAY_MS, TRAY_REVEAL_HOLD_MS,
 };
+use super::state_machine::{VisibleState, WindowState};
 use super::window_chrome::{self, SlideFrame};
 use super::WindowOps;
 use crate::application::ui_thread::hsm::SM_UI;
 
 pub struct TopEdgeDock {
     session: DockSession,
-    applying: bool,
-    apply_gen: u64,
     pointer_inside: bool,
     last_moved_at: Instant,
+    collapse_not_before: Option<Instant>,
     settle_gen: u64,
     collapse_gen: u64,
     poll_gen: u64,
@@ -29,17 +29,16 @@ pub struct TopEdgeDock {
     slide_frame: Option<SlideFrame>,
     last_hold_open: bool,
     wired: bool,
-    hidden_to_tray: bool,
 }
 
 impl TopEdgeDock {
+
     pub fn new() -> Self {
         Self {
             session: DockSession::new(),
-            applying: false,
-            apply_gen: 0,
             pointer_inside: true,
             last_moved_at: Instant::now(),
+            collapse_not_before: None,
             settle_gen: 0,
             collapse_gen: 0,
             poll_gen: 0,
@@ -47,23 +46,24 @@ impl TopEdgeDock {
             slide_frame: None,
             last_hold_open: false,
             wired: false,
-            hidden_to_tray: false,
         }
     }
 
     fn suspend_for_tray(&mut self) {
-        self.hidden_to_tray = true;
+        self.session.state.hide_to_tray();
+        self.collapse_not_before = None;
         self.settle_gen = self.settle_gen.wrapping_add(1);
         self.collapse_gen = self.collapse_gen.wrapping_add(1);
         self.poll_gen = self.poll_gen.wrapping_add(1);
         self.slide_gen = self.slide_gen.wrapping_add(1);
-        self.apply_gen = self.apply_gen.wrapping_add(1);
-        self.applying = false;
     }
 }
 
 impl WindowOps {
     pub(crate) fn hide_to_tray(&mut self, window: &Window) {
+        if window.is_maximized() {
+            self.top_dock.session.state = WindowState::Visible(VisibleState::Maximized);
+        }
         self.top_dock.suspend_for_tray();
         window_chrome::hide(window);
     }
@@ -81,17 +81,23 @@ impl WindowOps {
     }
 
     pub(super) fn sync_window_hover(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
-        if self.top_dock.hidden_to_tray {
+        // A hidden HWND can retain a stale hover flag. Only the screen-edge
+        // poll may wake a dock after its hide animation has completed.
+        if self.top_dock.session.state.is_tray_hidden()
+            || self.top_dock.session.state == WindowState::DockedHidden
+        {
             return;
         }
-        let hovered = window.is_window_hovered();
+        let hovered = window_chrome::cursor_point(window)
+            .map(|cursor| is_point_in_rect(cursor, window_chrome::window_rect(window)))
+            .unwrap_or_else(|| window.is_window_hovered());
         if hovered != self.top_dock.pointer_inside {
             self.note_window_hover(hovered, window, cx);
         }
     }
 
     pub(super) fn sync_dock_hold_open(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
-        if self.top_dock.hidden_to_tray {
+        if self.top_dock.session.state.is_tray_hidden() {
             return;
         }
         let hold_open = self.hold_open;
@@ -105,7 +111,7 @@ impl WindowOps {
         }
         if was
             && should_arm_collapse_on_hold_release(
-                self.top_dock.session.mode,
+                self.top_dock.session.mode(),
                 self.top_dock.pointer_inside,
             )
         {
@@ -114,17 +120,16 @@ impl WindowOps {
     }
 
     pub(crate) fn reveal_from_tray(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
-        let was_hidden = self.top_dock.hidden_to_tray;
-        self.top_dock.hidden_to_tray = false;
+        let was_hidden = self.top_dock.session.state.reveal_from_tray();
         self.top_dock.collapse_gen = self.top_dock.collapse_gen.wrapping_add(1);
         // A hide can interrupt the slide that was revealing a docked window.
-        if was_hidden && self.top_dock.session.mode == DockMode::Expanded {
+        if was_hidden && self.top_dock.session.mode() == DockMode::Expanded {
             if let Some(work) = window_chrome::work_area(window, cx) {
                 let box_ = self.reveal_box(work);
                 window_chrome::set_position(window, box_.x, box_.y);
             }
         }
-        if tray_reveal_plan(self.top_dock.session.mode) == TrayRevealPlan::ExpandDock {
+        if tray_reveal_plan(self.top_dock.session.mode()) == TrayRevealPlan::ExpandDock {
             if window_chrome::work_area(window, cx).is_none()
                 || self.top_dock.session.remembered.is_none()
             {
@@ -139,7 +144,10 @@ impl WindowOps {
     }
 
     fn restore_window(&self, window: &Window) {
-        window_chrome::restore(window);
+        window_chrome::restore(
+            window,
+            self.top_dock.session.state.visible_context() == VisibleState::Maximized,
+        );
         window.activate_window();
     }
 
@@ -149,35 +157,44 @@ impl WindowOps {
             .is_some_and(|cursor| is_point_in_rect(cursor, box_));
         self.top_dock.pointer_inside = over;
         if should_collapse_after_tray_reveal(over, self.hold_open) {
+            self.top_dock.collapse_not_before = Some(
+                Instant::now() + Duration::from_millis(TRAY_REVEAL_HOLD_MS),
+            );
             self.schedule_collapse(window, cx, TRAY_REVEAL_HOLD_MS);
         }
     }
 
     fn note_window_moved(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
-        if self.top_dock.hidden_to_tray {
+        if self.top_dock.session.state.is_tray_hidden() {
             return;
+        }
+        let moving = window_chrome::is_moving_or_resizing(window);
+        if !self.top_dock.session.state.note_geometry(moving) {
+            return;
+        }
+        if moving {
+            self.top_dock.collapse_not_before = None;
+            self.top_dock.slide_gen = self.top_dock.slide_gen.wrapping_add(1);
         }
         self.top_dock.last_moved_at = Instant::now();
-        if should_skip_settle(self.top_dock.applying, self.top_dock.session.mode) {
-            return;
-        }
+        self.top_dock.collapse_gen = self.top_dock.collapse_gen.wrapping_add(1);
         self.schedule_settle(window, cx);
     }
 
     fn note_window_hover(&mut self, inside: bool, window: &Window, cx: &mut Context<SM_UI>) {
         self.top_dock.pointer_inside = inside;
         if inside {
+            self.top_dock.collapse_not_before = None;
             self.top_dock.collapse_gen = self.top_dock.collapse_gen.wrapping_add(1);
-            if self.top_dock.session.mode != DockMode::Collapsed {
+            if self.top_dock.session.mode() != DockMode::Collapsed {
                 return;
             }
             self.expand_now(window, cx);
             return;
         }
-        if self.hold_open {
-            return;
+        if !self.hold_open && self.top_dock.session.mode() == DockMode::Expanded {
+            self.schedule_collapse(window, cx, COLLAPSE_DELAY_MS);
         }
-        self.schedule_collapse(window, cx, COLLAPSE_DELAY_MS);
     }
 
     fn schedule_settle(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
@@ -214,35 +231,16 @@ impl WindowOps {
         .detach();
     }
 
-    fn mark_applying(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
-        self.top_dock.applying = true;
-        self.top_dock.apply_gen = self.top_dock.apply_gen.wrapping_add(1);
-        let gen = self.top_dock.apply_gen;
-        cx.spawn_in(window, async move |this, cx| {
-            Timer::after(Duration::from_millis(APPLY_GUARD_MS)).await;
-            this.update(cx, |this, _cx| {
-                this.window_ops.hold_open = this.dock_hold_open();
-                if this.window_ops.top_dock.apply_gen == gen {
-                    this.window_ops.top_dock.applying = false;
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
     fn run_settle(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
-        if self.top_dock.hidden_to_tray
-            || should_skip_settle(self.top_dock.applying, self.top_dock.session.mode)
-        {
+        if !self.top_dock.session.state.is_geometry_pending() {
             return;
         }
-        // A pause in native dragging is not a release. Keep the dock context
-        // unchanged until Windows leaves its move/size loop.
         if window_chrome::is_moving_or_resizing(window) {
+            self.top_dock.session.state.note_geometry(true);
             self.schedule_settle(window, cx);
             return;
         }
+        self.top_dock.session.state.note_geometry(false);
         let Some(work) = window_chrome::work_area(window, cx) else {
             return;
         };
@@ -251,7 +249,7 @@ impl WindowOps {
         let minimized = window_chrome::is_minimized(window);
         remember_expanded_size(&mut self.top_dock.session, box_, maximized, minimized);
         let intent = intent_after_settle(
-            self.top_dock.session.mode,
+            self.top_dock.session.mode(),
             box_,
             work,
             self.top_dock.session.remembered,
@@ -259,16 +257,42 @@ impl WindowOps {
             minimized,
         );
         self.apply_now(intent, window, cx);
+        self.top_dock.session.state.settle(maximized);
+        if self.top_dock.session.state == WindowState::Visible(VisibleState::Docked)
+            && !self.top_dock.pointer_inside
+            && !self.hold_open
+        {
+            self.schedule_collapse(window, cx, COLLAPSE_DELAY_MS);
+        }
     }
 
     fn run_collapse(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
-        if self.top_dock.hidden_to_tray || self.hold_open || self.top_dock.pointer_inside {
+        if self.top_dock.session.state.is_tray_hidden()
+            || self.hold_open
+            || self.top_dock.pointer_inside
+        {
             return;
         }
         if window_chrome::is_moving_or_resizing(window) {
+            self.note_window_moved(window, cx);
             self.schedule_collapse(window, cx, COLLAPSE_DELAY_MS);
             return;
         }
+        if self.top_dock.session.state.is_geometry_pending() {
+            self.schedule_collapse(window, cx, COLLAPSE_DELAY_MS);
+            return;
+        }
+        if self.top_dock.session.state != WindowState::Visible(VisibleState::Docked) {
+            return;
+        }
+        // Restore-related bounds callbacks must not shorten the tray grace period.
+        if let Some(remaining) = self.top_dock.collapse_not_before
+            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+        {
+            self.schedule_collapse(window, cx, remaining.as_millis() as u64 + 1);
+            return;
+        }
+        self.top_dock.collapse_not_before = None;
         let elapsed_ms = self
             .top_dock
             .last_moved_at
@@ -284,7 +308,7 @@ impl WindowOps {
         };
         let box_ = window_chrome::window_rect(window);
         let intent = intent_after_pointer_leave(
-            self.top_dock.session.mode,
+            self.top_dock.session.mode(),
             box_,
             work,
             self.hold_open,
@@ -299,7 +323,7 @@ impl WindowOps {
         };
         let box_ = self.reveal_box(work);
         let intent = intent_after_pointer_enter(
-            self.top_dock.session.mode,
+            self.top_dock.session.mode(),
             box_,
             work,
             self.top_dock.session.remembered,
@@ -321,14 +345,13 @@ impl WindowOps {
     }
 
     fn apply_now(&mut self, intent: DockIntent, window: &Window, cx: &mut Context<SM_UI>) {
-        if self.top_dock.hidden_to_tray {
+        if self.top_dock.session.state.is_tray_hidden() {
             return;
         }
         let action = apply_intent(&mut self.top_dock.session, intent);
         if action == DockAction::None {
             return;
         }
-        self.mark_applying(window, cx);
         match action {
             DockAction::None => {}
             DockAction::ShowAt { x, y } => {
@@ -359,7 +382,7 @@ impl WindowOps {
                 .update_in(cx, |this, window, cx| {
                     this.window_ops.hold_open = this.dock_hold_open();
                     if this.window_ops.top_dock.poll_gen != gen
-                        || this.window_ops.top_dock.session.mode != DockMode::Collapsed
+                        || this.window_ops.top_dock.session.state != WindowState::DockedHidden
                     {
                         return false;
                     }
@@ -375,7 +398,7 @@ impl WindowOps {
     }
 
     fn poll_hot_edge_once(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
-        if self.top_dock.hidden_to_tray {
+        if self.top_dock.session.state.is_tray_hidden() {
             return;
         }
         let Some(work) = window_chrome::work_area(window, cx) else {
@@ -421,6 +444,7 @@ impl WindowOps {
                             return;
                         }
                         window_chrome::hide(window);
+                        this.window_ops.top_dock.session.state.finish_slide();
                         this.window_ops.start_hot_edge_poll(window, cx);
                     })
                     .ok();
@@ -433,6 +457,7 @@ impl WindowOps {
                         return;
                     }
                     window_chrome::finish_slide_hide(window, &frame);
+                    this.window_ops.top_dock.session.state.finish_slide();
                     this.window_ops.start_hot_edge_poll(window, cx);
                 })
                 .ok();
@@ -455,6 +480,18 @@ impl WindowOps {
                 .ok()
                 .flatten()
             else {
+                this.update_in(cx, |this, window, cx| {
+                    if this.window_ops.top_dock.slide_gen != gen {
+                        return;
+                    }
+                    if let Some(work) = window_chrome::work_area(window, cx) {
+                        let box_ = this.window_ops.reveal_box(work);
+                        window_chrome::set_position(window, box_.x, box_.y);
+                    }
+                    window_chrome::show(window);
+                    this.window_ops.top_dock.session.state.finish_slide();
+                })
+                .ok();
                 return;
             };
             Timer::after(Duration::from_millis(DOCK_PREPAINT_MS)).await;
@@ -466,6 +503,7 @@ impl WindowOps {
                 }
                 window_chrome::set_slide_y(window, frame.x, frame.rest_y);
                 window_chrome::finish_slide_show(window);
+                this.window_ops.top_dock.session.state.finish_slide();
             })
             .ok();
         })
@@ -503,5 +541,48 @@ async fn animate_slide(
             break;
         }
         Timer::after(Duration::from_millis(8)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tray_hide_invalidates_all_pending_window_effects_and_keeps_dock_geometry() {
+        for state in [WindowState::Collapsing, WindowState::Expanding] {
+            let mut dock = TopEdgeDock::new();
+            dock.session.state = state;
+            dock.session.docked_x = 200.0;
+            dock.session.docked_width = 1200.0;
+            dock.session.remembered = Some(Size {
+                width: 1200.0,
+                height: 800.0,
+            });
+            let tokens = (
+                dock.settle_gen,
+                dock.collapse_gen,
+                dock.poll_gen,
+                dock.slide_gen,
+            );
+            dock.suspend_for_tray();
+            assert_eq!(
+                dock.session.state,
+                WindowState::TrayHidden(VisibleState::Docked)
+            );
+            assert_ne!(tokens.0, dock.settle_gen);
+            assert_ne!(tokens.1, dock.collapse_gen);
+            assert_ne!(tokens.2, dock.poll_gen);
+            assert_ne!(tokens.3, dock.slide_gen);
+            assert_eq!(dock.session.docked_x, 200.0);
+            assert_eq!(dock.session.docked_width, 1200.0);
+            assert_eq!(
+                dock.session.remembered,
+                Some(Size {
+                    width: 1200.0,
+                    height: 800.0
+                })
+            );
+        }
     }
 }

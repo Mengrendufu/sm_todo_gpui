@@ -1,4 +1,6 @@
-//! Top-edge dock intents. Same rules as the Tauri `edgeDock` module.
+//! Window geometry policies and effects for the WindowOps state machine.
+
+use super::state_machine::{VisibleState, WindowState};
 
 pub const TOP_SNAP_PX: f32 = 28.0;
 pub const TOP_HOT_EDGE_PX: f32 = 0.0;
@@ -8,7 +10,6 @@ pub const SETTLE_DELAY_MS: u64 = 180;
 pub const HOT_EDGE_POLL_MS: u64 = 50;
 pub const DOCK_SLIDE_MS: u64 = 100;
 pub const DOCK_PREPAINT_MS: u64 = 64;
-pub const APPLY_GUARD_MS: u64 = SETTLE_DELAY_MS + DOCK_SLIDE_MS + 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DockMode {
@@ -95,12 +96,9 @@ pub fn intent_after_settle(
         return DockIntent::None;
     }
     if maximized {
-        if mode == DockMode::Free {
-            return DockIntent::None;
-        }
-        return DockIntent::Undock {
-            rect: visible_undock_rect(box_, work, remembered),
-        };
+        // Native maximization already owns the geometry. Updating the window
+        // context must not reposition it and undo that native state.
+        return DockIntent::None;
     }
     if mode == DockMode::Free {
         if !is_near_top(box_, work) {
@@ -208,7 +206,7 @@ pub fn slide_down_y(rest_y: i32, height: i32, t: f32) -> i32 {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DockSession {
-    pub mode: DockMode,
+    pub state: WindowState,
     pub remembered: Option<Size>,
     pub docked_x: f32,
     pub docked_width: f32,
@@ -217,10 +215,19 @@ pub struct DockSession {
 impl DockSession {
     pub fn new() -> Self {
         Self {
-            mode: DockMode::Free,
+            state: WindowState::Visible(VisibleState::Free),
             remembered: None,
             docked_x: 0.0,
             docked_width: 0.0,
+        }
+    }
+
+    /// Geometry policy view, derived from the single window behavior state.
+    pub fn mode(&self) -> DockMode {
+        match self.state {
+            WindowState::Collapsing | WindowState::DockedHidden => DockMode::Collapsed,
+            _ if self.state.visible_context() == VisibleState::Docked => DockMode::Expanded,
+            _ => DockMode::Free,
         }
     }
 }
@@ -233,10 +240,6 @@ pub enum DockAction {
     Show,
 }
 
-pub fn should_skip_settle(applying: bool, mode: DockMode) -> bool {
-    applying || mode == DockMode::Collapsed
-}
-
 pub fn collapse_should_wait_for_settle(elapsed_ms: u64) -> bool {
     elapsed_ms < SETTLE_DELAY_MS + 80
 }
@@ -246,7 +249,7 @@ pub fn should_arm_collapse_on_hold_release(mode: DockMode, pointer_inside: bool)
 }
 
 pub fn remember_expanded_size(session: &mut DockSession, box_: Rect, maximized: bool, minimized: bool) {
-    if session.mode == DockMode::Expanded && !maximized && !minimized {
+    if session.mode() == DockMode::Expanded && !maximized && !minimized {
         session.remembered = Some(Size {
             width: box_.width,
             height: box_.height,
@@ -257,34 +260,49 @@ pub fn remember_expanded_size(session: &mut DockSession, box_: Rect, maximized: 
 }
 
 pub fn apply_intent(session: &mut DockSession, intent: DockIntent) -> DockAction {
+    if session.state.is_tray_hidden() {
+        return DockAction::None;
+    }
+    if matches!(intent, DockIntent::Dock { .. } | DockIntent::Undock { .. })
+        && !matches!(
+            session.state,
+            WindowState::Visible(_) | WindowState::Settling(_)
+        )
+    {
+        return DockAction::None;
+    }
     match intent {
         DockIntent::None => DockAction::None,
         DockIntent::Dock { rect, remember } => {
             session.remembered = Some(remember);
             session.docked_x = rect.x;
             session.docked_width = rect.width;
-            session.mode = DockMode::Expanded;
+            session.state = WindowState::Visible(VisibleState::Docked);
             DockAction::ShowAt {
                 x: rect.x,
                 y: rect.y,
             }
         }
         DockIntent::Collapse { rect } => {
+            if !session.state.begin_collapse() {
+                return DockAction::None;
+            }
             session.remembered = Some(Size {
                 width: rect.width,
                 height: rect.height,
             });
             session.docked_x = rect.x;
             session.docked_width = rect.width;
-            session.mode = DockMode::Collapsed;
             DockAction::Hide
         }
         DockIntent::Expand { .. } => {
-            session.mode = DockMode::Expanded;
+            if !session.state.begin_expand() {
+                return DockAction::None;
+            }
             DockAction::Show
         }
         DockIntent::Undock { rect } => {
-            session.mode = DockMode::Free;
+            session.state = WindowState::Visible(VisibleState::Free);
             session.remembered = None;
             DockAction::ShowAt {
                 x: rect.x,
@@ -334,8 +352,8 @@ mod tests {
                 ..BOARD
             };
             let mut session = DockSession::new();
-            session.mode = DockMode::Expanded;
-            let intent = intent_after_settle(session.mode, moved, work, None, false, false);
+            session.state = WindowState::Visible(VisibleState::Docked);
+            let intent = intent_after_settle(session.mode(), moved, work, None, false, false);
             assert_eq!(
                 apply_intent(&mut session, intent),
                 DockAction::ShowAt {
@@ -343,10 +361,10 @@ mod tests {
                     y: work.y
                 }
             );
-            assert_eq!(session.mode, DockMode::Expanded);
+            assert_eq!(session.mode(), DockMode::Expanded);
             assert_eq!(
                 intent_after_settle(
-                    session.mode,
+                    session.mode(),
                     Rect { y: work.y, ..moved },
                     work,
                     session.remembered,
@@ -355,6 +373,23 @@ mod tests {
                 ),
                 DockIntent::None
             );
+        }
+    }
+
+    #[test]
+    fn a_pending_dock_cannot_move_the_window_before_release_or_after_tray_hide() {
+        for state in [
+            WindowState::Moving(VisibleState::Free),
+            WindowState::TrayHidden(VisibleState::Free),
+            WindowState::Collapsing,
+            WindowState::Expanding,
+        ] {
+            let mut session = DockSession::new();
+            session.state = state;
+            let before = session.clone();
+            let intent = intent_after_settle(DockMode::Free, BOARD, WORK, None, false, false);
+            assert_eq!(apply_intent(&mut session, intent), DockAction::None);
+            assert_eq!(session, before);
         }
     }
 
@@ -377,6 +412,14 @@ mod tests {
     fn a_maximized_window_never_docks() {
         assert_eq!(
             intent_after_settle(DockMode::Free, BOARD, WORK, None, true, false),
+            DockIntent::None
+        );
+    }
+
+    #[test]
+    fn maximizing_a_docked_window_never_emits_a_position_change() {
+        assert_eq!(
+            intent_after_settle(DockMode::Expanded, BOARD, WORK, None, true, false),
             DockIntent::None
         );
     }
@@ -579,7 +622,7 @@ mod tests {
                 y: 0.0,
             }
         );
-        assert_eq!(session.mode, DockMode::Expanded);
+        assert_eq!(session.mode(), DockMode::Expanded);
         assert_eq!(
             session.remembered,
             Some(Size {
@@ -594,7 +637,7 @@ mod tests {
     #[test]
     fn applying_a_collapse_hides_in_place_and_keeps_the_span() {
         let mut session = DockSession {
-            mode: DockMode::Expanded,
+            state: WindowState::Visible(VisibleState::Docked),
             remembered: Some(Size {
                 width: 1200.0,
                 height: 800.0,
@@ -605,7 +648,9 @@ mod tests {
         let expanded = Rect { y: 0.0, ..BOARD };
         let intent = intent_after_pointer_leave(DockMode::Expanded, expanded, WORK, false, false);
         assert_eq!(apply_intent(&mut session, intent), DockAction::Hide);
-        assert_eq!(session.mode, DockMode::Collapsed);
+        assert_eq!(session.state, WindowState::Collapsing);
+        session.state.finish_slide();
+        assert_eq!(session.state, WindowState::DockedHidden);
         assert_eq!(session.docked_x, 200.0);
         assert_eq!(session.docked_width, 1200.0);
     }
@@ -613,7 +658,7 @@ mod tests {
     #[test]
     fn applying_an_expand_shows_without_changing_size() {
         let mut session = DockSession {
-            mode: DockMode::Collapsed,
+            state: WindowState::DockedHidden,
             remembered: Some(Size {
                 width: 1200.0,
                 height: 800.0,
@@ -629,7 +674,9 @@ mod tests {
             session.remembered,
         );
         assert_eq!(apply_intent(&mut session, intent), DockAction::Show);
-        assert_eq!(session.mode, DockMode::Expanded);
+        assert_eq!(session.state, WindowState::Expanding);
+        session.state.finish_slide();
+        assert_eq!(session.state, WindowState::Visible(VisibleState::Docked));
         assert_eq!(
             session.remembered,
             Some(Size {
@@ -642,7 +689,7 @@ mod tests {
     #[test]
     fn applying_an_undock_clears_the_session_and_shows_at_the_new_origin() {
         let mut session = DockSession {
-            mode: DockMode::Expanded,
+            state: WindowState::Visible(VisibleState::Docked),
             remembered: Some(Size {
                 width: 1200.0,
                 height: 800.0,
@@ -665,14 +712,14 @@ mod tests {
                 y: 90.0,
             }
         );
-        assert_eq!(session.mode, DockMode::Free);
+        assert_eq!(session.mode(), DockMode::Free);
         assert_eq!(session.remembered, None);
     }
 
     #[test]
     fn an_expanded_resize_updates_the_remembered_size() {
         let mut session = DockSession {
-            mode: DockMode::Expanded,
+            state: WindowState::Visible(VisibleState::Docked),
             remembered: Some(Size {
                 width: 1200.0,
                 height: 800.0,
@@ -700,13 +747,6 @@ mod tests {
         );
         assert_eq!(session.docked_x, 180.0);
         assert_eq!(session.docked_width, 1100.0);
-    }
-
-    #[test]
-    fn settle_is_skipped_while_applying_or_collapsed() {
-        assert!(should_skip_settle(true, DockMode::Free));
-        assert!(should_skip_settle(false, DockMode::Collapsed));
-        assert!(!should_skip_settle(false, DockMode::Expanded));
     }
 
     #[test]

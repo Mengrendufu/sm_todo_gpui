@@ -2,6 +2,7 @@
 //! SM_UI is the GPUI callback host; its controls only supply interaction/save state.
 
 mod edge_dock;
+mod state_machine;
 mod top_edge_dock;
 mod tray_icon;
 mod window_chrome;
