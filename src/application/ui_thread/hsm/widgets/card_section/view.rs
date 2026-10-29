@@ -26,7 +26,7 @@ pub(in crate::application::ui_thread::hsm) struct ColumnView {
     pub(super) rows: Vec<(Entity<CardView>, f32)>,
     pub(super) offsets: Vec<f32>,
     pub(super) content_key: Vec<(EntityId, u64)>,
-    pub(super) motion_key: (u64, u64, usize, usize),
+    pub(super) motion_key: super::ColumnMotion,
     pub(super) appearance: Option<Theme>,
 }
 
@@ -59,7 +59,7 @@ impl ColumnView {
             rows: Vec::new(),
             offsets: vec![0.],
             content_key: Vec::new(),
-            motion_key: (0, 0, 0, 0),
+            motion_key: super::ColumnMotion::default(),
             appearance: None,
         }
     }
@@ -80,16 +80,22 @@ impl ColumnView {
             self.input.release(token);
         }
         if effects.started || effects.finished.is_some() {
+            // Global interaction state changes only at capture boundaries.
             gpui::App::notify(cx, self.owner.entity_id());
-            cx.notify();
+            Self::notify_column(cx);
         }
+    }
+
+    /// Column scope: invalidate this column without refreshing sibling columns.
+    pub(super) fn notify_column(cx: &mut Context<Self>) {
+        cx.notify();
     }
 
     fn set_scroll(&mut self, y: f32, cx: &mut Context<Self>) {
         let offset = point(px(0.), px(-y));
         if self.scroll.offset() != offset {
             self.scroll.set_offset(offset);
-            cx.notify();
+            Self::notify_column(cx);
         }
     }
 
@@ -112,7 +118,7 @@ impl ColumnView {
                             before: None,
                             pointer: Some((f32::from(pointer.x), f32::from(pointer.y))),
                         });
-                        cx.notify();
+                        SM_UI::notify_global(cx);
                     })
                     .ok();
             })
@@ -175,7 +181,7 @@ impl ColumnView {
                             f32::from(scrolled),
                         );
                         if this.hover_pointer(status, y) {
-                            cx.notify();
+                            SM_UI::notify_global(cx);
                         }
                     })
                     .ok();
@@ -213,7 +219,7 @@ impl ColumnView {
                                 pointer: Some((f32::from(pointer.x), f32::from(pointer.y))),
                             });
                         }
-                        cx.notify();
+                        SM_UI::notify_global(cx);
                     })
                     .ok();
             })
@@ -302,7 +308,7 @@ impl Render for ColumnView {
         let theme = Theme::for_window(window);
         let scrollbar = self.scrollbar(theme, cx);
         let status = self.status;
-        let kids = if self.motion_key.2 > 0 || self.motion_key.3 > 0 {
+        let kids = if self.motion_key.is_active() {
             self.owner
                 .update(cx, |owner, cx| {
                     owner.column_animation_children(status, theme, cx)

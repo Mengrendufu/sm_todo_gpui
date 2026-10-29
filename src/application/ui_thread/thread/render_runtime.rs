@@ -43,7 +43,7 @@ pub fn RenderRuntime_run(wake_rx: Receiver<()>, snapshot: Snapshot, client: Data
                 move |window, cx| {
                     let ui = cx.new(|cx| {
                         cx.observe_window_appearance(window, |_, _, cx| {
-                            cx.notify();
+                            SM_UI::notify_global(cx);
                         })
                         .detach();
                         SM_UI::setup(
@@ -58,7 +58,7 @@ pub fn RenderRuntime_run(wake_rx: Receiver<()>, snapshot: Snapshot, client: Data
                     ui.update(cx, |sm, cx| {
                         sm.window_ops.attach(window, cx);
                         sm.column_input.attach(window);
-                        cx.notify();
+                        SM_UI::notify_global(cx);
                     });
                     ui
                 },
@@ -112,7 +112,7 @@ pub fn RenderRuntime_run(wake_rx: Receiver<()>, snapshot: Snapshot, client: Data
                         window.remove_window();
                         cx.quit();
                     } else {
-                        cx.notify();
+                        SM_UI::notify_global(cx);
                     }
                 });
             }

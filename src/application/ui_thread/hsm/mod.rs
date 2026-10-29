@@ -485,6 +485,11 @@ impl DerefMut for SM_UI {
 }
 
 impl SM_UI {
+    /// Global scope: update root coordination; unchanged columns keep their caches.
+    pub(in crate::application::ui_thread) fn notify_global(cx: &mut Context<Self>) {
+        cx.notify();
+    }
+
     pub(crate) fn cancel_scrollbar_drag(&mut self, _cx: &mut Context<Self>) {
         self.column_input.post_cancel();
     }

@@ -8,13 +8,25 @@ pub(in crate::application::ui_thread::hsm) use view::{column_element, ColumnView
 use super::super::theme::Theme;
 use crate::application::snapshot::Status;
 use crate::application::ui_thread::hsm::{
-    status_key, theme, ColumnItem, UI_Controls, HOLE_ANIM_MS, SM_UI,
+    status_key, theme, ColumnItem, HolePhase, UI_Controls, HOLE_ANIM_MS, SM_UI,
 };
 use gpui::{div, prelude::*, px, Context};
 
 pub const COLUMN_PAD_X: f32 = 12.0;
 pub const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 const ROW_OVERDRAW: f32 = 64.0;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ColumnMotion {
+    holes: Vec<(u64, HolePhase, Option<String>)>,
+    slides: Vec<(u64, String)>,
+}
+
+impl ColumnMotion {
+    fn is_active(&self) -> bool {
+        !self.holes.is_empty() || !self.slides.is_empty()
+    }
+}
 
 pub fn scrollbar_thumb(
     viewport: f32,
@@ -111,6 +123,23 @@ fn spacer(height: f32) -> gpui::AnyElement {
 }
 
 impl UI_Controls {
+    fn column_motion(&self, status: Status) -> ColumnMotion {
+        ColumnMotion {
+            holes: self
+                .holes
+                .iter()
+                .filter(|hole| hole.status == status)
+                .map(|hole| (hole.epoch, hole.phase, hole.before_id.clone()))
+                .collect(),
+            slides: self
+                .slides
+                .iter()
+                .filter(|slide| slide.status == status)
+                .map(|slide| (slide.epoch, slide.id.clone()))
+                .collect(),
+        }
+    }
+
     pub(in crate::application::ui_thread::hsm) fn sync_column_views(
         &mut self,
         theme: theme::Theme,
@@ -129,12 +158,7 @@ impl UI_Controls {
                     (entry.view.entity_id(), entry.revision)
                 })
                 .collect::<Vec<_>>();
-            let motion = (
-                self.hole_epoch,
-                self.slide_epoch,
-                self.holes.len(),
-                self.slides.len(),
-            );
+            let motion = self.column_motion(status);
             if self.column_views[index].is_none() {
                 let owner = cx.entity().downgrade();
                 self.column_views[index] = Some(cx.new(|_| {
@@ -154,10 +178,10 @@ impl UI_Controls {
                 .as_ref()
                 .unwrap()
                 .update(cx, |column, cx| {
-                    if column.content_key != content
-                        || column.motion_key != motion
-                        || column.appearance != Some(theme)
-                    {
+                    let content_changed = column.content_key != content;
+                    let motion_changed = column.motion_key != motion;
+                    let appearance_changed = column.appearance != Some(theme);
+                    if content_changed {
                         column.rows = self
                             .snapshot
                             .cards
@@ -176,9 +200,15 @@ impl UI_Controls {
                                 .collect::<Vec<_>>(),
                         );
                         column.content_key = content;
+                    }
+                    if motion_changed {
                         column.motion_key = motion;
+                    }
+                    if appearance_changed {
                         column.appearance = Some(theme);
-                        cx.notify();
+                    }
+                    if content_changed || motion_changed || appearance_changed {
+                        ColumnView::notify_column(cx);
                     }
                 });
         }
@@ -252,6 +282,49 @@ impl UI_Controls {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drag_motion_stays_in_affected_columns_and_duplicate_targets_are_noops() {
+        use crate::application::{data_manager::DataManager, snapshot::Snapshot};
+        let (database, cards) = DataManager::open_in_memory(|_| {}).unwrap();
+        let mut controls = UI_Controls::new(Snapshot::new(cards), database.client());
+        controls.add_todo_card("A");
+        controls.add_todo_card("B");
+        let id = controls.snapshot.cards[0].id.clone();
+        let untouched = controls.column_motion(Status::Done);
+
+        controls.start_drag(&id);
+        let source = controls.column_motion(Status::Todo);
+        assert!(source.is_active());
+        assert!(!controls.column_motion(Status::Doing).is_active());
+        assert_eq!(controls.column_motion(Status::Done), untouched);
+
+        assert!(controls.hover_insert(Status::Todo, None));
+        assert_ne!(controls.column_motion(Status::Todo), source);
+        assert_eq!(controls.column_motion(Status::Done), untouched);
+
+        assert!(controls.hover_insert(Status::Doing, None));
+        assert!(controls.column_motion(Status::Todo).is_active());
+        let target = controls.column_motion(Status::Doing);
+        assert!(target.is_active());
+        assert_eq!(controls.column_motion(Status::Done), untouched);
+        assert!(!controls.hover_insert(Status::Doing, None));
+        assert_eq!(controls.column_motion(Status::Doing), target);
+
+        controls.cancel_drag();
+        assert!(
+            controls.column_motion(Status::Doing).is_active(),
+            "closing animation must remain active after leaving"
+        );
+        assert_eq!(controls.column_motion(Status::Done), untouched);
+        for hole in &mut controls.holes {
+            hole.started =
+                std::time::Instant::now() - std::time::Duration::from_millis(HOLE_ANIM_MS + 1);
+        }
+        controls.flush();
+        assert!(!controls.column_motion(Status::Doing).is_active());
+        assert_eq!(controls.column_motion(Status::Done), untouched);
+    }
 
     #[test]
     fn viewport_selects_only_intersecting_rows_with_a_small_overdraw() {

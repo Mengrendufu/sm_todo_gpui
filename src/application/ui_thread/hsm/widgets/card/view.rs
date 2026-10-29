@@ -48,6 +48,8 @@ impl Render for CardView {
             .min_h(px(pitch))
             .overflow_hidden()
             .cursor_move()
+            // GPUI's native active_drag still forces a global refresh per move.
+            // Column-scoped notifications cannot override that framework path.
             .on_drag(payload, {
                 let view = view.clone();
                 move |info, offset, window, cx| {
@@ -78,7 +80,7 @@ impl Render for CardView {
                                     this.column_scroll[status_key(status) as usize].offset().y,
                                 ),
                             );
-                            cx.notify();
+                            SM_UI::notify_global(cx);
                             this.ghost_size_for(status).0
                         })
                         .unwrap_or(0.0);
@@ -94,7 +96,7 @@ impl Render for CardView {
                         let pointer = window.mouse_position();
                         this.note_pointer(f32::from(pointer.x), f32::from(pointer.y));
                         this.post_drop();
-                        cx.notify();
+                        SM_UI::notify_global(cx);
                     })
                     .ok();
             })
@@ -107,7 +109,7 @@ impl Render for CardView {
                                 return;
                             }
                             UI_Inbox_post(UI_Evt::EditCard { id: id.clone() });
-                            cx.notify();
+                            SM_UI::notify_global(cx);
                         })
                         .ok();
                 }
