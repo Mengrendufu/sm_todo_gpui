@@ -24,6 +24,7 @@ impl SM_HsmTrait for UI_Controls {
                     | UI_Evt::EditCard { .. }
                     | UI_Evt::SaveEditor
                     | UI_Evt::DeleteEditor
+                    | UI_Evt::DropCard { .. }
             )
         {
             return;
@@ -56,6 +57,15 @@ static BOARD: SM_HsmState<UI_Controls> = SM_HsmState {
     entry_: None,
     exit_: None,
     handler_: |me, e| match e {
+        UI_Evt::DropCard { id, status, before, pointer } => {
+            if let Some((x, y)) = pointer { me.note_pointer(*x, *y); }
+            me.drop_card(id, *status, before.as_deref());
+            SM_RetState::HANDLED
+        }
+        UI_Evt::CancelCardDrag => {
+            me.cancel_drag();
+            SM_RetState::HANDLED
+        }
         UI_Evt::NewCard if me.dragging.is_none() => {
             me.open_create();
             SM_RetState::TRAN(&EDITOR)
@@ -123,6 +133,23 @@ mod tests {
         for e in inbox.take_all() {
             ui.dispatch_evt(&e);
         }
+    }
+
+    #[test]
+    fn card_drop_changes_snapshot_only_after_queued_dispatch() {
+        let (_database, mut ui) = ui();
+        ui.add_todo_card("move me");
+        let id = ui.snapshot.cards[0].id.clone();
+        let mut inbox = UI_Inbox::new();
+        inbox.post(UI_Evt::DropCard { id: id.clone(), status: Status::Doing, before: None, pointer: None });
+        assert_eq!(ui.snapshot.cards[0].status, Status::Todo);
+        drain(&mut inbox, &mut ui);
+        assert_eq!(ui.snapshot.cards[0].status, Status::Doing);
+        // An active editor keeps a late board drop from mutating its snapshot.
+        ui.dispatch_evt(&UI_Evt::EditCard { id: id.clone() });
+        inbox.post(UI_Evt::DropCard { id, status: Status::Done, before: None, pointer: None });
+        drain(&mut inbox, &mut ui);
+        assert_eq!(ui.snapshot.cards[0].status, Status::Doing);
     }
 
     #[test]

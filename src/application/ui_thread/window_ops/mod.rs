@@ -94,8 +94,13 @@ impl WindowOps {
         cx: &mut Context<SM_UI>,
     ) -> DispatchResult {
         match event {
+            UI_Evt::Window(event) => {
+                sm.window_ops.hold_open = sm.dock_hold_open();
+                sm.window_ops.dispatch_event(*event, window, cx);
+            }
             UI_Evt::TrayShow => sm.window_ops.reveal_from_tray(window, cx),
             UI_Evt::HideToTray => {
+                sm.cancel_scrollbar_drag(cx);
                 sm.cancel_drag();
                 sm.post_pending();
                 sm.window_ops.hide_to_tray(window);
@@ -104,7 +109,10 @@ impl WindowOps {
                 sm.window_ops.toggle_pin();
                 sm.window_ops.apply_always_on_top(window);
             }
-            UI_Evt::TrayQuit => sm.begin_close(),
+            UI_Evt::TrayQuit => {
+                sm.cancel_scrollbar_drag(cx);
+                sm.begin_close();
+            }
             _ => return DispatchResult::Unhandled,
         }
         DispatchResult::Handled

@@ -15,6 +15,7 @@ use super::edge_dock::{
 use super::state_machine::{VisibleState, WindowState};
 use super::window_chrome::{self, SlideFrame};
 use super::WindowOps;
+use crate::application::ui_thread::thread::{evt::{UI_Evt, WindowEvent}, inbox::UI_Inbox_post};
 use crate::application::ui_thread::hsm::SM_UI;
 
 pub struct TopEdgeDock {
@@ -73,14 +74,13 @@ impl WindowOps {
             return;
         }
         self.top_dock.wired = true;
-        cx.observe_window_bounds(window, |this, window, cx| {
-            this.window_ops.hold_open = this.dock_hold_open();
-            this.window_ops.note_window_moved(window, cx);
+        cx.observe_window_bounds(window, |_, _, _| {
+            UI_Inbox_post(UI_Evt::Window(WindowEvent::GeometryChanged));
         })
         .detach();
     }
 
-    pub(super) fn sync_window_hover(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
+    pub(super) fn sync_window_hover(&mut self, window: &Window, _cx: &mut Context<SM_UI>) {
         // A hidden HWND can retain a stale hover flag. Only the screen-edge
         // poll may wake a dock after its hide animation has completed.
         if self.top_dock.session.state.is_tray_hidden()
@@ -92,11 +92,11 @@ impl WindowOps {
             .map(|cursor| is_point_in_rect(cursor, window_chrome::window_rect(window)))
             .unwrap_or_else(|| window.is_window_hovered());
         if hovered != self.top_dock.pointer_inside {
-            self.note_window_hover(hovered, window, cx);
+            UI_Inbox_post(UI_Evt::Window(WindowEvent::HoverChanged(hovered)));
         }
     }
 
-    pub(super) fn sync_dock_hold_open(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
+    pub(super) fn sync_dock_hold_open(&mut self, _window: &Window, _cx: &mut Context<SM_UI>) {
         if self.top_dock.session.state.is_tray_hidden() {
             return;
         }
@@ -109,13 +109,37 @@ impl WindowOps {
             }
             return;
         }
-        if was
-            && should_arm_collapse_on_hold_release(
-                self.top_dock.session.mode(),
-                self.top_dock.pointer_inside,
-            )
-        {
-            self.schedule_collapse(window, cx, COLLAPSE_DELAY_MS);
+        if was { UI_Inbox_post(UI_Evt::Window(WindowEvent::HoldReleased)); }
+    }
+
+    pub(super) fn dispatch_event(&mut self, event: WindowEvent, window: &Window, cx: &mut Context<SM_UI>) {
+        match event {
+            WindowEvent::GeometryChanged => self.note_window_moved(window, cx),
+            WindowEvent::HoverChanged(inside) => {
+                if inside != self.top_dock.pointer_inside { self.note_window_hover(inside, window, cx); }
+            }
+            WindowEvent::HoldReleased => {
+                if should_arm_collapse_on_hold_release(self.top_dock.session.mode(), self.top_dock.pointer_inside) && !self.hold_open {
+                    self.schedule_collapse(window, cx, COLLAPSE_DELAY_MS);
+                }
+            }
+            WindowEvent::SettleDue(gen) => {
+                if self.top_dock.settle_gen == gen { self.run_settle(window, cx); }
+            }
+            WindowEvent::CollapseDue(gen) => {
+                if self.top_dock.collapse_gen == gen { self.run_collapse(window, cx); }
+            }
+            WindowEvent::HotEdgeDue(gen) => {
+                if self.top_dock.poll_gen == gen && self.top_dock.session.state == WindowState::DockedHidden {
+                    self.poll_hot_edge_once(window, cx);
+                }
+            }
+            WindowEvent::SlideFinished { generation, hide } => {
+                if self.top_dock.slide_gen == generation {
+                    self.top_dock.session.state.finish_slide();
+                    if hide { self.start_hot_edge_poll(window, cx); }
+                }
+            }
         }
     }
 
@@ -200,16 +224,9 @@ impl WindowOps {
     fn schedule_settle(&mut self, window: &Window, cx: &mut Context<SM_UI>) {
         self.top_dock.settle_gen = self.top_dock.settle_gen.wrapping_add(1);
         let gen = self.top_dock.settle_gen;
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn_in(window, async move |_this, _cx| {
             Timer::after(Duration::from_millis(SETTLE_DELAY_MS)).await;
-            this.update_in(cx, |this, window, cx| {
-                this.window_ops.hold_open = this.dock_hold_open();
-                if this.window_ops.top_dock.settle_gen != gen {
-                    return;
-                }
-                this.window_ops.run_settle(window, cx);
-            })
-            .ok();
+            UI_Inbox_post(UI_Evt::Window(WindowEvent::SettleDue(gen)));
         })
         .detach();
     }
@@ -217,16 +234,9 @@ impl WindowOps {
     fn schedule_collapse(&mut self, window: &Window, cx: &mut Context<SM_UI>, delay_ms: u64) {
         self.top_dock.collapse_gen = self.top_dock.collapse_gen.wrapping_add(1);
         let gen = self.top_dock.collapse_gen;
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn_in(window, async move |_this, _cx| {
             Timer::after(Duration::from_millis(delay_ms)).await;
-            this.update_in(cx, |this, window, cx| {
-                this.window_ops.hold_open = this.dock_hold_open();
-                if this.window_ops.top_dock.collapse_gen != gen {
-                    return;
-                }
-                this.window_ops.run_collapse(window, cx);
-            })
-            .ok();
+            UI_Inbox_post(UI_Evt::Window(WindowEvent::CollapseDue(gen)));
         })
         .detach();
     }
@@ -379,14 +389,14 @@ impl WindowOps {
         cx.spawn_in(window, async move |this, cx| loop {
             Timer::after(Duration::from_millis(HOT_EDGE_POLL_MS)).await;
             let keep = this
-                .update_in(cx, |this, window, cx| {
+                .update_in(cx, |this, _window, _cx| {
                     this.window_ops.hold_open = this.dock_hold_open();
                     if this.window_ops.top_dock.poll_gen != gen
                         || this.window_ops.top_dock.session.state != WindowState::DockedHidden
                     {
                         return false;
                     }
-                    this.window_ops.poll_hot_edge_once(window, cx);
+                    UI_Inbox_post(UI_Evt::Window(WindowEvent::HotEdgeDue(gen)));
                     true
                 })
                 .unwrap_or(false);
@@ -438,27 +448,25 @@ impl WindowOps {
                     .ok()
                     .flatten()
                 else {
-                    this.update_in(cx, |this, window, cx| {
+                    this.update_in(cx, |this, window, _cx| {
                         this.window_ops.hold_open = this.dock_hold_open();
                         if this.window_ops.top_dock.slide_gen != gen {
                             return;
                         }
                         window_chrome::hide(window);
-                        this.window_ops.top_dock.session.state.finish_slide();
-                        this.window_ops.start_hot_edge_poll(window, cx);
+                        UI_Inbox_post(UI_Evt::Window(WindowEvent::SlideFinished { generation: gen, hide: true }));
                     })
                     .ok();
                     return;
                 };
                 animate_slide(this.clone(), cx, gen, frame, true).await;
-                this.update_in(cx, |this, window, cx| {
+                this.update_in(cx, |this, window, _cx| {
                     this.window_ops.hold_open = this.dock_hold_open();
                     if this.window_ops.top_dock.slide_gen != gen {
                         return;
                     }
                     window_chrome::finish_slide_hide(window, &frame);
-                    this.window_ops.top_dock.session.state.finish_slide();
-                    this.window_ops.start_hot_edge_poll(window, cx);
+                    UI_Inbox_post(UI_Evt::Window(WindowEvent::SlideFinished { generation: gen, hide: true }));
                 })
                 .ok();
                 return;
@@ -489,7 +497,7 @@ impl WindowOps {
                         window_chrome::set_position(window, box_.x, box_.y);
                     }
                     window_chrome::show(window);
-                    this.window_ops.top_dock.session.state.finish_slide();
+                    UI_Inbox_post(UI_Evt::Window(WindowEvent::SlideFinished { generation: gen, hide: false }));
                 })
                 .ok();
                 return;
@@ -503,7 +511,7 @@ impl WindowOps {
                 }
                 window_chrome::set_slide_y(window, frame.x, frame.rest_y);
                 window_chrome::finish_slide_show(window);
-                this.window_ops.top_dock.session.state.finish_slide();
+                UI_Inbox_post(UI_Evt::Window(WindowEvent::SlideFinished { generation: gen, hide: false }));
             })
             .ok();
         })

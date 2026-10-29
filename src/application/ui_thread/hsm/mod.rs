@@ -15,6 +15,7 @@ use crate::application::ui_thread::thread::evt::UI_Evt;
 use crate::application::ui_thread::thread::inbox::UI_Inbox_post;
 use rs_hsm_::{SM_Hsm, SM_HsmTrait};
 use std::ops::{Deref, DerefMut};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -432,6 +433,7 @@ struct DropSettle {
     epoch: u64,
     started: Instant,
     shown: bool,
+    handing_off: bool,
 }
 
 impl DropSettle {
@@ -448,15 +450,6 @@ impl DropSettle {
     }
 }
 
-struct ScrollbarDrag {
-    status: Status,
-    track_top: f32,
-    track_h: f32,
-    grab: f32,
-    viewport: f32,
-    max_scroll: f32,
-}
-
 struct Editor {
     kind: card_editor::EditorKind,
     title: String,
@@ -470,6 +463,7 @@ struct Editor {
 
 pub struct SM_UI {
     pub(super) window_ops: WindowOps,
+    pub(super) column_input: card_section::input::ColumnInput,
     hsm: SM_Hsm<UI_Controls>,
     controls: UI_Controls,
 }
@@ -491,10 +485,19 @@ impl DerefMut for SM_UI {
 }
 
 impl SM_UI {
+    pub(crate) fn cancel_scrollbar_drag(&mut self, _cx: &mut Context<Self>) {
+        self.column_input.post_cancel();
+    }
+
+    pub(crate) fn dock_hold_open(&self) -> bool {
+        self.controls.dock_hold_open() || self.column_input.active()
+    }
+
     pub fn setup(_host: SM_UI_HostOps, snapshot: Snapshot, client: DataClient) -> Self {
         let mut me = Self {
             hsm: SM_Hsm::new(),
             window_ops: WindowOps::new(),
+            column_input: card_section::input::ColumnInput::default(),
             controls: UI_Controls::new(snapshot, client),
         };
         UI_Controls::init(&mut me.hsm, &mut me.controls);
@@ -556,7 +559,9 @@ pub struct UI_Controls {
     list_scroll_y: f32,
     column_frame: [Option<(f32, f32, f32)>; 3],
     settling: Option<DropSettle>,
-    scrollbar_drag: Option<ScrollbarDrag>,
+    column_views: [Option<Entity<card_section::ColumnView>>; 3],
+    card_views: HashMap<String, card::view::CardEntry>,
+    cards_dirty: bool,
     editor: Option<Editor>,
     title_field: Option<Entity<text_field::TextField>>,
     notes_field: Option<Entity<text_field::TextField>>,
@@ -594,7 +599,9 @@ impl UI_Controls {
             list_scroll_y: 0.0,
             column_frame: [None, None, None],
             settling: None,
-            scrollbar_drag: None,
+            column_views: [None, None, None],
+            card_views: HashMap::new(),
+            cards_dirty: true,
             editor: None,
             title_field: None,
             notes_field: None,
@@ -611,6 +618,7 @@ impl UI_Controls {
 
     pub fn add_todo_card(&mut self, title: &str) {
         if let Ok(changes) = self.snapshot.create_card(title, "") {
+            self.cards_dirty = true;
             self.persistence.stage(changes);
         }
     }
@@ -739,6 +747,7 @@ impl UI_Controls {
         };
         match result {
             Ok(changes) => {
+                self.cards_dirty = true;
                 self.persistence.stage(changes);
                 self.editor = None;
                 true
@@ -759,6 +768,7 @@ impl UI_Controls {
         match card_editor::command_on_editor_delete(&editor.kind) {
             card_editor::PersistCommand::Delete { id } => {
                 let Ok(changes) = self.snapshot.delete_card(&id) else { return false; };
+                self.cards_dirty = true;
                 self.persistence.stage(changes);
                 self.editor = None;
                 true
@@ -1043,7 +1053,7 @@ impl UI_Controls {
 
     pub fn card_is_hidden(&self, id: &str) -> bool {
         self.dragging.as_ref().is_some_and(|d| d.id == id)
-            || self.settling.as_ref().is_some_and(|s| s.id == id)
+            || self.settling.as_ref().is_some_and(|s| s.id == id && !s.handing_off)
             || self.slides.iter().any(|slide| slide.id == id)
     }
 
@@ -1115,6 +1125,7 @@ impl UI_Controls {
             epoch: self.hole_epoch,
             started: Instant::now(),
             shown: false,
+            handing_off: false,
         })
     }
 
@@ -1207,6 +1218,7 @@ impl UI_Controls {
         if self.closing { return; }
         let settle = self.capture_settle(id, to_status, before_id);
         let Ok(changes) = self.snapshot.move_card(id, to_status, before_id) else { return; };
+        self.cards_dirty = true;
         self.persistence.stage(changes);
         self.dragging = None;
         self.last_hover_status = None;
@@ -1243,6 +1255,13 @@ impl UI_Controls {
         false
     }
 
+    pub(super) fn post_drop(&self) {
+        if let Some(drag) = &self.dragging {
+            UI_Inbox_post(UI_Evt::DropCard { id: drag.id.clone(), status: drag.to_status, before: drag.before_id.clone(), pointer: self.pointer_x.zip(self.pointer_y) });
+        }
+    }
+
+    #[cfg(test)]
     pub fn commit_drop(&mut self) {
         if let Some((id, status, before)) = self
             .dragging
@@ -1390,8 +1409,14 @@ impl UI_Controls {
         let can_post = match self.settling.as_ref().map(|settle| settle.shown) {
             Some(false) => false,
             Some(true) => {
-                if self.settling.as_ref().is_some_and(|settle| settle.started.elapsed() >= settle_limit) {
+                if self.settling.as_ref().is_some_and(|settle| settle.handing_off) {
                     self.settling = None;
+                } else if let Some(settle) = self.settling.as_mut() {
+                    if settle.started.elapsed() >= settle_limit {
+                        // Keep the final overlay while the card's visibility
+                        // invalidation reaches GPUI's next-frame view cache.
+                        settle.handing_off = true;
+                    }
                 }
                 true
             }
@@ -1418,98 +1443,6 @@ impl UI_Controls {
         }
     }
 
-    fn card_element(
-        &self,
-        card: &Card,
-        status: Status,
-        theme: theme::Theme,
-        cx: &mut Context<SM_UI>,
-    ) -> impl IntoElement {
-        let id = card.id.clone();
-        let payload = DragCard {
-            card: card.clone(),
-        };
-        let view = cx.entity().downgrade();
-        let hidden = self.card_is_hidden(&id);
-        let inner = self.card_inner_width(status);
-        let body = card::card_body_height(&card.title, &card.notes, inner);
-        let pitch = body + card::SLOT_GAP;
-        let tile = div()
-            .w_full()
-            .flex_none()
-            .h(px(body))
-            .min_h(px(body))
-            .opacity(if hidden { 0. } else { 1. })
-            .child(card::render(card, theme));
-        div()
-            .id(("card", hash_id(&id)))
-            .w_full()
-            .flex_none()
-            .h(px(pitch))
-            .min_h(px(pitch))
-            .overflow_hidden()
-            .cursor_move()
-            .on_drag(payload, {
-                let view = view.clone();
-                move |info, offset, window, cx| {
-                    let width = view
-                        .update(cx, |this, cx| {
-                            this.start_drag(&info.card.id);
-                            this.set_grab_offset(f32::from(offset.x), f32::from(offset.y));
-                            this.note_pointer(
-                                f32::from(window.mouse_position().x),
-                                f32::from(window.mouse_position().y),
-                            );
-                            let this = &mut this.controls;
-                            this.note_column_frame(
-                                status,
-                                f32::from(
-                                    this.column_scroll[status_key(status) as usize]
-                                        .bounds()
-                                        .origin
-                                        .x,
-                                ),
-                                f32::from(
-                                    this.column_scroll[status_key(status) as usize]
-                                        .bounds()
-                                        .origin
-                                        .y,
-                                ),
-                                f32::from(
-                                    this.column_scroll[status_key(status) as usize]
-                                        .offset()
-                                        .y,
-                                ),
-                            );
-                            cx.notify();
-                            this.ghost_size_for(status).0
-                        })
-                        .unwrap_or(0.0);
-                    cx.new(|_| DragPreview {
-                        card: info.card.clone(),
-                        width,
-                    })
-                }
-            })
-            .on_drop(cx.listener(move |this, _: &DragCard, window, cx| {
-                let pointer = window.mouse_position();
-                this.note_pointer(f32::from(pointer.x), f32::from(pointer.y));
-                this.commit_drop();
-                cx.notify();
-            }))
-            .on_click(cx.listener({
-                let id = id.clone();
-                move |this, _, _, cx| {
-                    if this.dragging.is_some() {
-                        return;
-                    }
-                    UI_Inbox_post(UI_Evt::EditCard { id: id.clone() });
-                    cx.notify();
-                }
-            }))
-            .child(tile)
-    }
-
     fn hole_element(
         &self,
         epoch: u64,
@@ -1534,7 +1467,7 @@ impl UI_Controls {
                     .on_drop(cx.listener(move |this, _: &DragCard, window, cx| {
                         let pointer = window.mouse_position();
                         this.note_pointer(f32::from(pointer.x), f32::from(pointer.y));
-                        this.commit_drop();
+                        this.post_drop();
                         cx.notify();
                     }))
                     .child(card::placeholder(theme, body))
@@ -1549,7 +1482,7 @@ impl UI_Controls {
                 .on_drop(cx.listener(move |this, _: &DragCard, window, cx| {
                     let pointer = window.mouse_position();
                     this.note_pointer(f32::from(pointer.x), f32::from(pointer.y));
-                    this.commit_drop();
+                    this.post_drop();
                     cx.notify();
                 }))
                 .child(card::placeholder(theme, body))
@@ -1566,20 +1499,6 @@ impl UI_Controls {
                 .into_any_element(),
         };
         slot
-    }
-
-    fn append_slot(&self, status: Status, cx: &mut Context<SM_UI>) -> impl IntoElement {
-        div()
-            .id(("append", status_key(status)))
-            .flex_1()
-            .w_full()
-            .min_h(px(32.))
-            .on_drop(cx.listener(move |this, info: &DragCard, window, cx| {
-                let pointer = window.mouse_position();
-                this.note_pointer(f32::from(pointer.x), f32::from(pointer.y));
-                this.drop_card(&info.card.id, status, None);
-                cx.notify();
-            }))
     }
 
     fn squeeze_overlays_in(&self, status: Status, theme: theme::Theme) -> Vec<gpui::AnyElement> {
@@ -1682,12 +1601,21 @@ impl UI_Controls {
 
 impl Render for SM_UI {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.column_input.active()
+            && (!window.is_window_active() || self.controls.editor.is_some() || self.controls.closing)
+        {
+            self.cancel_scrollbar_drag(cx);
+        }
         // Preserve the first landing frame before scheduling persistence.
         if let Some(e) = self.controls.flush() {
             UI_Inbox_post(e);
         }
-        self.window_ops.sync(self.controls.dock_hold_open(), window, cx);
-        self.controls.render_controls(window, cx, self.window_ops.is_pinned())
+        let theme = theme::Theme::for_window(window);
+        self.controls.sync_card_views(theme, cx);
+        self.controls.sync_column_views(theme, &self.column_input, cx);
+        let hold_open = self.dock_hold_open();
+        self.window_ops.sync(hold_open, window, cx);
+        self.controls.render_controls(window, cx, self.window_ops.is_pinned(), self.column_input.element().into_any_element())
     }
 }
 
@@ -1704,7 +1632,7 @@ impl UI_Controls {
         }
     }
 
-    fn render_controls(&mut self, window: &mut Window, cx: &mut Context<SM_UI>, pinned: bool) -> impl IntoElement {
+    fn render_controls(&mut self, window: &mut Window, cx: &mut Context<SM_UI>, pinned: bool, capture_input: gpui::AnyElement) -> gpui::Div {
         if self.editor.is_some() {
             self.ensure_editor_fields(cx, window);
         }
@@ -1728,27 +1656,25 @@ impl UI_Controls {
                     cx.notify();
                 }
             }))
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _cx| {
                 if this.dragging.is_some() {
                     this.note_pointer(
                         f32::from(event.position.x),
                         f32::from(event.position.y),
                     );
                 }
-                if this.move_scrollbar_drag(f32::from(event.position.y)) {
-                    cx.notify();
-                }
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    this.scrollbar_drag = None;
                     if this.dragging.is_some() {
-                        this.cancel_drag();
+                        UI_Inbox_post(UI_Evt::CancelCardDrag);
+                        cx.notify();
                     }
-                    cx.notify();
                 }),
             )
+            // Register capture routing before descendant hover/drag listeners.
+            .child(capture_input)
             .child(self.render_titlebar(window, theme, pinned, cx))
             .child(
                 div()
@@ -1771,9 +1697,9 @@ impl UI_Controls {
                     .min_h_0()
                     .gap_4()
                     .p_6()
-                    .child(self.render_card_section("待办", Status::Todo, theme, cx))
-                    .child(self.render_card_section("进行中", Status::Doing, theme, cx))
-                    .child(self.render_card_section("完成", Status::Done, theme, cx)),
+                    .children(self.column_views.iter().map(|view| {
+                        card_section::column_element(view.as_ref().expect("column view"))
+                    })),
             )
             .child(self.settle_overlay(window, theme))
             .child(self.render_card_editor(theme, cx))
@@ -2601,6 +2527,9 @@ mod tests {
         assert!(settle.0.abs() > 1.0 || settle.1.abs() > 1.0);
         sm.expire_settle();
         flush(&mut sm);
+        assert_eq!(sm.settling_id(), Some(a.as_str()), "overlay bridges the cache handoff frame");
+        assert!(!sm.card_is_hidden(&a), "the real card becomes visible before the overlay is removed");
+        flush(&mut sm);
         assert_eq!(sm.settling_id(), None);
         assert!(!sm.card_is_hidden(&a));
     }
@@ -2687,6 +2616,10 @@ mod tests {
         flush(&mut sm);
         assert_eq!(sm.settling_id(), Some(a.as_str()));
         sm.expire_settle();
+        flush(&mut sm);
+        assert_eq!(sm.settling_id(), Some(a.as_str()));
+        assert!(!sm.card_is_hidden(&a));
+        assert_eq!(sm.settling.as_mut().unwrap().progress(Instant::now()), 1.0);
         flush(&mut sm);
         assert_eq!(sm.settling_id(), None);
     }

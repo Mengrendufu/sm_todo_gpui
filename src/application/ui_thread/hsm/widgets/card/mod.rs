@@ -4,6 +4,7 @@ pub mod calendar;
 pub mod editor;
 pub mod meta;
 pub mod text_field;
+pub(in crate::application::ui_thread::hsm) mod view;
 
 use super::super::theme::Theme;
 use super::card_section::COLUMN_PAD_X;

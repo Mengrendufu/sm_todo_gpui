@@ -1,14 +1,20 @@
-//! Card sections: column appearance, scrolling and drag targets.
+//! Card sections: retained column views, visible rows and drag targets.
+
+pub(in crate::application::ui_thread) mod input;
+mod state_machine;
+mod view;
+pub(in crate::application::ui_thread::hsm) use view::{column_element, ColumnView};
 
 use super::super::theme::Theme;
 use crate::application::snapshot::Status;
 use crate::application::ui_thread::hsm::{
-    status_key, theme, ColumnItem, DragCard, ScrollbarDrag, UI_Controls, SM_UI,
+    status_key, theme, ColumnItem, UI_Controls, HOLE_ANIM_MS, SM_UI,
 };
-use gpui::{div, point, prelude::*, px, Context, DragMoveEvent, MouseButton, MouseDownEvent};
+use gpui::{div, prelude::*, px, Context};
 
 pub const COLUMN_PAD_X: f32 = 12.0;
 pub const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+const ROW_OVERDRAW: f32 = 64.0;
 
 pub fn scrollbar_thumb(
     viewport: f32,
@@ -76,184 +82,201 @@ pub fn render(
         .child(list)
 }
 
+fn row_offsets(heights: &[f32]) -> Vec<f32> {
+    let mut offsets = Vec::with_capacity(heights.len() + 1);
+    offsets.push(0.);
+    for height in heights {
+        offsets.push(offsets.last().copied().unwrap() + height);
+    }
+    offsets
+}
+
+fn visible_rows(offsets: &[f32], top: f32, viewport: f32) -> std::ops::Range<usize> {
+    let count = offsets.len().saturating_sub(1);
+    if viewport <= 0. {
+        return 0..count.min(1);
+    }
+    let start = offsets
+        .partition_point(|y| *y <= (top - ROW_OVERDRAW).max(0.))
+        .saturating_sub(1)
+        .min(count);
+    let end = offsets
+        .partition_point(|y| *y < top + viewport + ROW_OVERDRAW)
+        .min(count);
+    start..end.max(start)
+}
+
+fn spacer(height: f32) -> gpui::AnyElement {
+    div().w_full().h(px(height)).flex_none().into_any_element()
+}
+
 impl UI_Controls {
-    pub(in crate::application::ui_thread::hsm) fn move_scrollbar_drag(
+    pub(in crate::application::ui_thread::hsm) fn sync_column_views(
         &mut self,
-        pointer_y: f32,
-    ) -> bool {
-        let Some(drag) = self.scrollbar_drag.as_ref() else {
-            return false;
-        };
-        let thumb_top = pointer_y - drag.track_top - drag.grab;
-        let scroll_y =
-            scroll_y_from_thumb_top(thumb_top, drag.viewport, drag.max_scroll, drag.track_h);
-        let status = drag.status;
-        self.column_scroll[status_key(status) as usize].set_offset(point(px(0.), px(-scroll_y)));
-        true
-    }
-
-    pub(in crate::application::ui_thread::hsm) fn column_scrollbar(
-        &self,
-        status: Status,
         theme: theme::Theme,
+        input: &input::ColumnInput,
         cx: &mut Context<SM_UI>,
-    ) -> impl IntoElement {
-        let scroll = &self.column_scroll[status_key(status) as usize];
-        let viewport = f32::from(scroll.bounds().size.height);
-        let max_scroll = f32::from(scroll.max_offset().height);
-        let scroll_y = -f32::from(scroll.offset().y);
-        let Some((top, thumb_h)) = scrollbar_thumb(viewport, max_scroll, scroll_y, viewport) else {
-            return div().into_any_element();
-        };
-        let track_top = f32::from(scroll.bounds().origin.y);
-        div()
-            .id(("col-scroll", status_key(status)))
-            .absolute()
-            .top_0()
-            .right_0()
-            .w(px(8.))
-            .h_full()
-            .occlude()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                    let y = f32::from(ev.position.y) - track_top;
-                    if y >= top && y <= top + thumb_h {
-                        this.scrollbar_drag = Some(ScrollbarDrag {
-                            status,
-                            track_top,
-                            track_h: viewport,
-                            grab: (y - top).clamp(0.0, thumb_h),
-                            viewport,
-                            max_scroll,
-                        });
-                    } else {
-                        let scroll_y = scroll_y_from_thumb_top(
-                            y - thumb_h / 2.0,
-                            viewport,
-                            max_scroll,
-                            viewport,
+    ) {
+        for status in [Status::Todo, Status::Doing, Status::Done] {
+            let index = status_key(status) as usize;
+            let content = self
+                .snapshot
+                .cards
+                .iter()
+                .filter(|card| card.status == status)
+                .map(|card| {
+                    let entry = &self.card_views[&card.id];
+                    (entry.view.entity_id(), entry.revision)
+                })
+                .collect::<Vec<_>>();
+            let motion = (
+                self.hole_epoch,
+                self.slide_epoch,
+                self.holes.len(),
+                self.slides.len(),
+            );
+            if self.column_views[index].is_none() {
+                let owner = cx.entity().downgrade();
+                self.column_views[index] = Some(cx.new(|_| {
+                    ColumnView::new(
+                        owner,
+                        status,
+                        self.column_scroll[index].clone(),
+                        input.clone(),
+                    )
+                }));
+            }
+            input.register(
+                status,
+                self.column_views[index].as_ref().unwrap().downgrade(),
+            );
+            self.column_views[index]
+                .as_ref()
+                .unwrap()
+                .update(cx, |column, cx| {
+                    if column.content_key != content
+                        || column.motion_key != motion
+                        || column.appearance != Some(theme)
+                    {
+                        column.rows = self
+                            .snapshot
+                            .cards
+                            .iter()
+                            .filter(|card| card.status == status)
+                            .map(|card| {
+                                let entry = &self.card_views[&card.id];
+                                (entry.view.clone(), entry.body)
+                            })
+                            .collect();
+                        column.offsets = row_offsets(
+                            &column
+                                .rows
+                                .iter()
+                                .map(|(_, body)| body + super::card::SLOT_GAP)
+                                .collect::<Vec<_>>(),
                         );
-                        this.column_scroll[status_key(status) as usize]
-                            .set_offset(point(px(0.), px(-scroll_y)));
+                        column.content_key = content;
+                        column.motion_key = motion;
+                        column.appearance = Some(theme);
+                        cx.notify();
                     }
-                    cx.notify();
-                }),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top(px(top))
-                    .right(px(1.))
-                    .w(px(6.))
-                    .h(px(thumb_h))
-                    .rounded(px(3.))
-                    .bg(theme.line_strong()),
-            )
-            .into_any_element()
+                });
+        }
     }
 
-    pub(in crate::application::ui_thread::hsm) fn render_card_section(
+    pub(in crate::application::ui_thread::hsm) fn column_animation_children(
         &self,
-        title: &'static str,
         status: Status,
         theme: theme::Theme,
         cx: &mut Context<SM_UI>,
-    ) -> impl IntoElement {
-        let count = self.cards_in(status).len();
+    ) -> Vec<gpui::AnyElement> {
+        let items = self.column_items(status);
+        let scroll = &self.column_scroll[status_key(status) as usize];
+        let heights = items
+            .iter()
+            .map(|item| match item {
+                ColumnItem::Card(card) => self.card_views[&card.id].body + super::card::SLOT_GAP,
+                ColumnItem::Hole { epoch, phase } => {
+                    let elapsed = self
+                        .holes
+                        .iter()
+                        .find(|hole| hole.epoch == *epoch && hole.status == status)
+                        .map(|hole| hole.started.elapsed().as_secs_f32())
+                        .unwrap_or(0.);
+                    let progress =
+                        gpui::ease_in_out((elapsed / (HOLE_ANIM_MS as f32 / 1000.)).min(1.));
+                    crate::application::ui_thread::hsm::hole_box(
+                        *phase,
+                        progress,
+                        self.drag_pitch(),
+                    )
+                    .height
+                }
+            })
+            .collect::<Vec<_>>();
+        let prefix = row_offsets(&heights);
+        let visible = visible_rows(
+            &prefix,
+            -f32::from(scroll.offset().y),
+            f32::from(scroll.bounds().size.height),
+        );
         let mut kids = Vec::new();
-        for item in self.column_items(status) {
+        let mut skipped = 0.;
+        for (index, item) in items.into_iter().enumerate() {
+            // Keep animated holes alive; only card rows are culled.
+            if matches!(item, ColumnItem::Card(_)) && !visible.contains(&index) {
+                skipped += heights[index];
+                continue;
+            }
+            if skipped > 0. {
+                kids.push(spacer(skipped));
+                skipped = 0.;
+            }
             kids.push(match item {
                 ColumnItem::Hole { epoch, phase } => self
                     .hole_element(epoch, phase, theme, cx)
                     .into_any_element(),
-                ColumnItem::Card(card) => self
-                    .card_element(card, status, theme, cx)
-                    .into_any_element(),
+                ColumnItem::Card(card) => self.card_views[&card.id].element().into_any_element(),
             });
         }
-        kids.push(self.append_slot(status, cx).into_any_element());
+        if skipped > 0. {
+            kids.push(spacer(skipped));
+        }
         for overlay in self.squeeze_overlays_in(status, theme) {
             kids.push(overlay);
         }
-        let scroll = self.column_scroll[status_key(status) as usize].clone();
-        let list = div()
-            .id(title)
-            .relative()
-            .flex()
-            .flex_col()
-            .size_full()
-            .min_h_0()
-            .px_3()
-            .pb_3()
-            .overflow_y_scroll()
-            .track_scroll(&scroll)
-            .on_drag_move(
-                cx.listener(move |this, event: &DragMoveEvent<DragCard>, _, cx| {
-                    if this.dragging.is_none() {
-                        return;
-                    }
-                    this.note_pointer(
-                        f32::from(event.event.position.x),
-                        f32::from(event.event.position.y),
-                    );
-                    if !event.bounds.contains(&event.event.position) {
-                        return;
-                    }
-                    let local = event.event.position.y - event.bounds.origin.y;
-                    let scrolled = this.column_scroll[status_key(status) as usize].offset().y;
-                    let y = f32::from(local - scrolled);
-                    this.note_drag_geometry(
-                        f32::from(event.event.position.x),
-                        f32::from(event.event.position.y),
-                        f32::from(event.bounds.origin.x),
-                        f32::from(event.bounds.origin.y),
-                        f32::from(scrolled),
-                    );
-                    this.note_column_frame(
-                        status,
-                        f32::from(event.bounds.origin.x),
-                        f32::from(event.bounds.origin.y),
-                        f32::from(scrolled),
-                    );
-                    if this.hover_pointer(status, y) {
-                        cx.notify();
-                    }
-                }),
-            )
-            .children(kids);
-        let body = div()
-            .relative()
-            .flex()
-            .flex_1()
-            .min_h_0()
-            .child(list)
-            .child(self.column_scrollbar(status, theme, cx));
-        render(title, count, body, theme)
-            .drag_over::<DragCard>({
-                let gold_soft = theme.gold_soft();
-                move |style, _, _, _| style.bg(gold_soft)
-            })
-            .on_drop(cx.listener(move |this, info: &DragCard, window, cx| {
-                let pointer = window.mouse_position();
-                this.note_pointer(f32::from(pointer.x), f32::from(pointer.y));
-                let hovered_here = this
-                    .dragging
-                    .as_ref()
-                    .is_some_and(|d| d.to_status == status);
-                if hovered_here {
-                    this.commit_drop();
-                } else {
-                    this.drop_card(&info.card.id, status, None);
-                }
-                cx.notify();
-            }))
+        kids
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewport_selects_only_intersecting_rows_with_a_small_overdraw() {
+        let offsets = row_offsets(&[100.; 10]);
+        assert_eq!(visible_rows(&offsets, 500., 100.), 4..7);
+        assert_eq!(visible_rows(&offsets, 0., 100.), 0..2);
+        assert_eq!(visible_rows(&offsets, 900., 100.), 8..10);
+    }
+
+    #[test]
+    fn a_tall_card_stays_visible_when_the_viewport_is_inside_it() {
+        let offsets = row_offsets(&[70., 900., 40., 110.]);
+        assert_eq!(visible_rows(&offsets, 500., 200.), 1..2);
+        assert_eq!(*offsets.last().unwrap(), 1120.);
+    }
+
+    #[test]
+    fn an_empty_column_has_no_virtual_rows() {
+        assert_eq!(visible_rows(&row_offsets(&[]), 0., 500.), 0..0);
+    }
+
+    #[test]
+    fn an_unmeasured_viewport_bootstraps_without_building_the_entire_list() {
+        assert_eq!(visible_rows(&row_offsets(&[90.; 1000]), 0., 0.), 0..1);
+    }
 
     #[test]
     fn no_thumb_when_content_fits() {

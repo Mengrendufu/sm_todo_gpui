@@ -1,6 +1,6 @@
-//! Inbox: entity Component. Thread-external input door. Owns the UI_Evt queue.
-//! Does not interpret events. Cross-thread signals and GUI coordination requests
-//! enter as owned UI_Evt values; local widget interactions do not enter here.
+//! Inbox owns the ordered UI event queue. All semantic events enter here,
+//! including local widget HSM input; callbacks may still change local properties.
+//! Only RenderRuntime drains and routes events.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
